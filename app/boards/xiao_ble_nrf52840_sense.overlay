@@ -1,0 +1,35 @@
+/*
+ * Copyright (c) 2024 Nordic Semiconductor ASA
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Expose the 2 MB on-board QSPI flash (P25Q16H) as a USB Mass Storage disk.
+ *
+ * The internal-flash storage_partition defined in
+ * nrf52840_partition_uf2_sdv7.dtsi is deleted and re-created on the external
+ * QSPI flash instead.  The msc_disk0 node ties the partition to the USB MSC
+ * "NAND" LUN declared in main.c.
+ */
+
+/delete-node/ &storage_partition;
+
+&p25q16h {
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		storage_partition: partition@0 {
+			label = "storage";
+			reg = <0x00000000 0x00200000>; /* 2 MB */
+		};
+	};
+};
+
+/ {
+	msc_disk0 {
+		compatible = "zephyr,flash-disk";
+		partition = <&storage_partition>;
+		disk-name = "NAND";
+		cache-size = <4096>;
+	};
+};
