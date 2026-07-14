@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Expose the 2 MB on-board QSPI flash (P25Q16H) as a USB Mass Storage disk.
+ * Enable the on-board PDM microphone for audio recording.
  *
  * The internal-flash storage_partition defined in
  * nrf52840_partition_uf2_sdv7.dtsi is deleted and re-created on the external
@@ -32,4 +33,13 @@
 		disk-name = "NAND";
 		cache-size = <4096>;
 	};
+
+	/* Add a label to the microphone power regulator so C code can obtain
+	 * the device via DT_NODELABEL(mic_pwr) and call regulator_enable(). */
+	mic_pwr: msm261d3526hicpm-c-en {};
+};
+
+/* PDM0 is disabled by default in the nRF52840 DTSI; enable it here. */
+&pdm0 {
+	status = "okay";
 };
