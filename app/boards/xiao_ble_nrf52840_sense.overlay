@@ -39,7 +39,11 @@
 	mic_pwr: msm261d3526hicpm-c-en {};
 };
 
-/* PDM0 is disabled by default in the nRF52840 DTSI; enable it here. */
+/* PDM0 is disabled by default in the nRF52840 DTSI; enable it here.
+ * The recording design uses a separate FAT-writer thread so the PDM reader
+ * frees slab blocks almost immediately (just a memcpy).  queue-size=4 is
+ * therefore sufficient: 2 (HW double-buffer) + 2 (rx_queue margin) = 4. */
 &pdm0 {
 	status = "okay";
+	queue-size = <4>;
 };

@@ -1,10 +1,13 @@
-/*
+﻿/*
  * Copyright (c) 2021 Nordic Semiconductor ASA
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <stdlib.h>
+
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/shell/shell.h>
 #include <zephyr/usb/usbd.h>
 #include <zephyr/usb/class/usbd_msc.h>
 #include <zephyr/storage/disk_access.h>
@@ -18,60 +21,68 @@
 LOG_MODULE_REGISTER(main, CONFIG_APP_LOG_LEVEL);
 
 /* ===========================================================================
- * Audio configuration
+ * Audio / PDM configuration
  * =========================================================================== */
 
 #define SAMPLE_RATE      16000U
 #define NUM_CHANNELS     1U
 #define BITS_PER_SAMPLE  16U
 #define BYTES_PER_SAMPLE (BITS_PER_SAMPLE / 8U)
-#define RECORD_SECONDS   1U
 
-/* 100 ms PDM blocks; two fit in RAM simultaneously for double-buffering */
-#define BLOCK_MS         100U
-#define BLOCK_SAMPLES    (SAMPLE_RATE * BLOCK_MS / 1000U)
-#define BLOCK_BYTES      (BLOCK_SAMPLES * NUM_CHANNELS * BYTES_PER_SAMPLE)
-
-/* 4 blocks needed: the nRF52840 PDM hardware double-buffers internally, so the
- * driver always requires 2 buffers staged in hardware, plus 1 queued for the
- * application to read, plus 1 spare so the driver can stage the next fill
- * without stalling.  Using only 2 causes ENOMEM in dmic_nrfx_pdm. */
-#define SLAB_NUM_BLOCKS  4U
+/* 100 ms PDM blocks.
+ * With the two-thread design the PDM reader frees each slab block almost
+ * immediately (just a memcpy into the ring buffer).  The slab only needs to
+ * cover hardware double-buffering (always 2) plus the rx_queue (queue-size=4)
+ * plus 1 briefly held by the reader, plus 1 spare: 2+4+1+1 = 8.
+ * We use 10 for a little extra margin. */
+#define BLOCK_MS        100U
+#define BLOCK_SAMPLES   (SAMPLE_RATE * BLOCK_MS / 1000U)
+#define BLOCK_BYTES     (BLOCK_SAMPLES * NUM_CHANNELS * BYTES_PER_SAMPLE)
+#define SLAB_NUM_BLOCKS 10U
 K_MEM_SLAB_DEFINE_STATIC(pdm_mem_slab, BLOCK_BYTES, SLAB_NUM_BLOCKS, 4);
 
-#define AUDIO_BYTES (SAMPLE_RATE * RECORD_SECONDS * NUM_CHANNELS * BYTES_PER_SAMPLE)
-/* 32 000 B, kept in BSS so it does not consume stack */
-static int16_t audio_buf[SAMPLE_RATE * RECORD_SECONDS];
+/* Ring buffer between the PDM reader thread and the FAT writer thread.
+ * 20 slots × 3200 B = 64 000 B ≈ 2 s – absorbs all flash-write and USB-MSC
+ * latency spikes without ever blocking the PDM read path. */
+#define RING_BLOCKS 20U
+static uint8_t ring_buf[RING_BLOCKS][BLOCK_BYTES];
+static int     ring_wr_idx;
+static K_SEM_DEFINE(ring_space_sem, RING_BLOCKS, RING_BLOCKS);
+
+struct ring_msg {
+	uint8_t  *buf;   /* pointer into ring_buf; NULL = end-of-recording */
+	uint32_t  size;
+};
+K_MSGQ_DEFINE(ring_msgq, sizeof(struct ring_msg), RING_BLOCKS + 1U, 4);
 
 /* ===========================================================================
- * WAV file header (44 bytes, standard RIFF PCM)
+ * WAV file header (44-byte RIFF PCM)
  * =========================================================================== */
 
 struct wav_hdr {
-	uint8_t  riff[4];
-	uint32_t riff_size;   /* total file size - 8 */
-	uint8_t  wave[4];
-	uint8_t  fmt_id[4];
-	uint32_t fmt_size;    /* 16 for PCM */
-	uint16_t audio_fmt;   /* 1 = PCM */
-	uint16_t channels;
-	uint32_t sample_rate;
-	uint32_t byte_rate;
-	uint16_t block_align;
-	uint16_t bits;
-	uint8_t  data_id[4];
-	uint32_t data_size;
+uint8_t  riff[4];
+uint32_t riff_size;   /* total file size - 8             */
+uint8_t  wave[4];
+uint8_t  fmt_id[4];
+uint32_t fmt_size;    /* 16 for PCM                      */
+uint16_t audio_fmt;   /* 1 = PCM                         */
+uint16_t channels;
+uint32_t sample_rate;
+uint32_t byte_rate;
+uint16_t block_align;
+uint16_t bits;
+uint8_t  data_id[4];
+uint32_t data_size;
 } __packed;
 
-/* ---------------------------------------------------------------------------
- * USB device descriptors
- *
- * VID 0x2FE3 is the Zephyr project vendor ID – replace with your own for
- * production use.
- * --------------------------------------------------------------------------- */
+/* ===========================================================================
+ * USB device setup (composite CDC-ACM + MSC)
+ * =========================================================================== */
+
+/* VID 0x2FE3 is the Zephyr project vendor ID -- replace with your own. */
 USBD_DEVICE_DEFINE(usbd_msc_dev,
-		   DEVICE_DT_GET(DT_NODELABEL(zephyr_udc0)),
-		   0x2FE3, 0x0008);
+   DEVICE_DT_GET(DT_NODELABEL(zephyr_udc0)),
+   0x2FE3, 0x0008);
 
 USBD_DESC_LANG_DEFINE(usbd_lang);
 USBD_DESC_MANUFACTURER_DEFINE(usbd_mfr, "Seeed Studio");
@@ -82,34 +93,57 @@ USBD_DESC_SERIAL_NUMBER_DEFINE(usbd_sn);
 #endif
 
 USBD_DESC_CONFIG_DEFINE(usbd_fs_cfg_desc, "FS Configuration");
-USBD_CONFIGURATION_DEFINE(usbd_fs_config,
-			   0,   /* attributes: bus-powered */
-			   125, /* bMaxPower: 250 mA (in 2 mA units) */
-			   &usbd_fs_cfg_desc);
+USBD_CONFIGURATION_DEFINE(usbd_fs_config, 0, 125, &usbd_fs_cfg_desc);
 
-/* ---------------------------------------------------------------------------
- * MSC Logical Unit
- *
- * "NAND" must match the disk-name property of the msc_disk0 DTS node in the
- * board overlay.
- * --------------------------------------------------------------------------- */
+/* "NAND" must match disk-name in the board overlay */
 USBD_DEFINE_MSC_LUN(nand, "NAND", "Seeed", "XIAO Flash", "0.01");
 
-/* No class instances are excluded from registration */
 static const char *const usbd_blocklist[] = {NULL};
 
 /* ===========================================================================
- * Recording
+ * Recording state
  * =========================================================================== */
 
-static int record_audio(void)
-{
-	const struct device *dmic = DEVICE_DT_GET(DT_NODELABEL(pdm0));
+static K_MUTEX_DEFINE(rec_mutex);
+static bool      rec_active;
+static atomic_t  rec_bytes        = ATOMIC_INIT(0); /* bytes written to file */
+static atomic_t  rec_bytes_queued = ATOMIC_INIT(0); /* bytes enqueued to ring */
+static atomic_t  rec_stop_req     = ATOMIC_INIT(0);
+static uint32_t  rec_max_bytes;
 
-	if (!device_is_ready(dmic)) {
-		LOG_ERR("PDM device not ready");
-		return -ENODEV;
-	}
+/* PDM reader thread (high priority – keeps up with hardware) */
+#define REC_STACK_SIZE 4096
+static K_THREAD_STACK_DEFINE(rec_stack, REC_STACK_SIZE);
+static struct k_thread rec_thread;
+
+/* FAT writer thread (lower priority – may stall on flash/USB without issue) */
+#define WRITE_STACK_SIZE 4096
+static K_THREAD_STACK_DEFINE(write_stack, WRITE_STACK_SIZE);
+static struct k_thread write_thread;
+
+static struct fs_file_t  rec_file;
+static FATFS             rec_fat_fs;
+static struct fs_mount_t rec_mnt = {
+	.type      = FS_FATFS,
+	.fs_data   = &rec_fat_fs,
+	.mnt_point = "/NAND:",
+};
+
+/* ===========================================================================
+ * PDM reader thread
+ * Reads blocks from the PDM driver and copies them into the ring buffer.
+ * The slab block is freed immediately after the copy so the driver never
+ * stalls waiting for a free slab slot.
+ * =========================================================================== */
+
+static void rec_thread_fn(void *p1, void *p2, void *p3)
+{
+	ARG_UNUSED(p1);
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	const struct device *dmic = DEVICE_DT_GET(DT_NODELABEL(pdm0));
+	int ret;
 
 	struct pcm_stream_cfg stream = {
 		.pcm_width  = BITS_PER_SAMPLE,
@@ -119,7 +153,6 @@ static int record_audio(void)
 	};
 	struct dmic_cfg cfg = {
 		.io = {
-			/* PDM clock range for the MSM261D3526HICPM-C */
 			.min_pdm_clk_freq = 1000000,
 			.max_pdm_clk_freq = 3200000,
 			.min_pdm_clk_dc   = 40,
@@ -129,256 +162,510 @@ static int record_audio(void)
 		.channel = {
 			.req_num_streams = 1,
 			.req_num_chan    = NUM_CHANNELS,
-			/*
-			 * XIAO BLE Sense SELECT pin is tied low: data is on the
-			 * clock falling edge (left channel).
-			 * Change to PDM_CHAN_RIGHT if the recording is silent.
-			 */
 			.req_chan_map_lo = dmic_build_channel_map(0, 0, PDM_CHAN_LEFT),
 		},
 	};
 
-	int ret = dmic_configure(dmic, &cfg);
-
+	ret = dmic_configure(dmic, &cfg);
 	if (ret < 0) {
-		LOG_ERR("dmic_configure failed: %d", ret);
-		return ret;
+		LOG_ERR("dmic_configure: %d", ret);
+		goto send_sentinel;
 	}
 
 	ret = dmic_trigger(dmic, DMIC_TRIGGER_START);
 	if (ret < 0) {
-		LOG_ERR("DMIC START failed: %d", ret);
-		return ret;
+		LOG_ERR("DMIC START: %d", ret);
+		goto send_sentinel;
 	}
 
-	/* Discard the first block – PDM filter warm-up noise */
+	/* Discard the first block: PDM filter warm-up. */
 	{
 		void *buf;
 		uint32_t size;
 
-		ret = dmic_read(dmic, 0, &buf, &size, BLOCK_MS + 500);
-		if (ret < 0) {
-			LOG_ERR("DMIC warm-up read failed: %d", ret);
-			dmic_trigger(dmic, DMIC_TRIGGER_STOP);
-			return ret;
+		if (dmic_read(dmic, 0, &buf, &size, BLOCK_MS * 2) == 0) {
+			k_mem_slab_free(&pdm_mem_slab, buf);
 		}
-		k_mem_slab_free(&pdm_mem_slab, buf);
 	}
 
-	const uint32_t total_blocks = (SAMPLE_RATE * RECORD_SECONDS) / BLOCK_SAMPLES;
-	uint32_t offset = 0;
+	/* Recording loop ---------------------------------------------------- */
+	while (!atomic_get(&rec_stop_req)) {
 
-	for (uint32_t i = 0; i < total_blocks; i++) {
-		void *buf;
-		uint32_t size;
-
-		ret = dmic_read(dmic, 0, &buf, &size, BLOCK_MS + 500);
-		if (ret < 0) {
-			LOG_ERR("DMIC read block %u failed: %d", i, ret);
+		/* Honor the optional max-duration limit */
+		if (rec_max_bytes > 0 &&
+		    (uint32_t)atomic_get(&rec_bytes_queued) >= rec_max_bytes) {
 			break;
 		}
 
-		uint32_t to_copy = MIN(size, AUDIO_BYTES - offset);
+		void *pdm_buf;
+		uint32_t size;
 
-		memcpy((uint8_t *)audio_buf + offset, buf, to_copy);
-		offset += to_copy;
-		k_mem_slab_free(&pdm_mem_slab, buf);
+		ret = dmic_read(dmic, 0, &pdm_buf, &size, BLOCK_MS * 2);
+		if (ret < 0) {
+			LOG_ERR("DMIC read: %d", ret);
+			break;
+		}
+
+		/* Clamp the last block to the max-bytes limit */
+		uint32_t to_copy = size;
+
+		if (rec_max_bytes > 0) {
+			uint32_t queued   = (uint32_t)atomic_get(&rec_bytes_queued);
+			uint32_t remaining = rec_max_bytes - queued;
+
+			if (to_copy > remaining) {
+				to_copy = remaining;
+			}
+		}
+
+		/* Copy into ring buffer.  Use K_NO_WAIT so the PDM reader never
+		 * stalls: if the ring is full (FAT writer blocked by a slow flash
+		 * erase or a Windows drive-scan holding the flashdisk mutex), drop
+		 * this block and loop back to dmic_read immediately.  A dropped
+		 * block causes a brief audio glitch but keeps the recording alive
+		 * rather than letting the rx_queue overflow and killing it. */
+		if (k_sem_take(&ring_space_sem, K_NO_WAIT) != 0) {
+			LOG_WRN("Ring full – dropping PDM block (flash/USB busy)");
+			k_mem_slab_free(&pdm_mem_slab, pdm_buf);
+			continue;
+		}
+		memcpy(ring_buf[ring_wr_idx], pdm_buf, to_copy);
+		k_mem_slab_free(&pdm_mem_slab, pdm_buf);
+
+		struct ring_msg msg = {
+			.buf  = ring_buf[ring_wr_idx],
+			.size = to_copy,
+		};
+		k_msgq_put(&ring_msgq, &msg, K_NO_WAIT);
+		ring_wr_idx = (ring_wr_idx + 1) % RING_BLOCKS;
+		atomic_add(&rec_bytes_queued, to_copy);
 	}
 
 	dmic_trigger(dmic, DMIC_TRIGGER_STOP);
-	return (ret < 0) ? ret : 0;
+
+	/* Drain any blocks still queued in the driver */
+	{
+		void *buf;
+		uint32_t size;
+
+		while (dmic_read(dmic, 0, &buf, &size, 0) == 0) {
+			k_mem_slab_free(&pdm_mem_slab, buf);
+		}
+	}
+
+send_sentinel:
+	/* Tell the FAT writer there is no more data */
+	{
+		struct ring_msg sentinel = {.buf = NULL, .size = 0};
+
+		k_msgq_put(&ring_msgq, &sentinel, K_FOREVER);
+	}
 }
 
 /* ===========================================================================
- * WAV file save
+ * FAT writer thread
+ * Drains the ring buffer and writes each block to the open FAT file.
+ * Slow flash erases and USB-MSC mutex contention only block this thread;
+ * the PDM reader above is completely unaffected.
  * =========================================================================== */
 
-static int save_wav(const char *path)
+static void write_thread_fn(void *p1, void *p2, void *p3)
 {
-	struct wav_hdr hdr = {
-		.riff        = {'R', 'I', 'F', 'F'},
-		.riff_size   = AUDIO_BYTES + sizeof(struct wav_hdr) - 8,
-		.wave        = {'W', 'A', 'V', 'E'},
-		.fmt_id      = {'f', 'm', 't', ' '},
-		.fmt_size    = 16,
-		.audio_fmt   = 1,
-		.channels    = NUM_CHANNELS,
-		.sample_rate = SAMPLE_RATE,
-		.byte_rate   = SAMPLE_RATE * NUM_CHANNELS * BYTES_PER_SAMPLE,
-		.block_align = NUM_CHANNELS * BYTES_PER_SAMPLE,
-		.bits        = BITS_PER_SAMPLE,
-		.data_id     = {'d', 'a', 't', 'a'},
-		.data_size   = AUDIO_BYTES,
-	};
+	ARG_UNUSED(p1);
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
 
-	struct fs_file_t file;
+	while (true) {
+		struct ring_msg msg;
 
-	fs_file_t_init(&file);
+		k_msgq_get(&ring_msgq, &msg, K_FOREVER);
 
-	int ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE | FS_O_TRUNC);
+		if (!msg.buf) {
+			break;  /* NULL sentinel = PDM reader has finished */
+		}
+
+		ssize_t written = fs_write(&rec_file, msg.buf, msg.size);
+
+		k_sem_give(&ring_space_sem);  /* return the ring slot */
+
+		if (written >= 0) {
+			atomic_add(&rec_bytes, (atomic_val_t)written);
+		} else {
+			LOG_ERR("fs_write: %zd (flash full?)", written);
+		}
+	}
+
+	/* Drain any leftover messages (e.g. after a write error) */
+	{
+		struct ring_msg msg;
+
+		while (k_msgq_get(&ring_msgq, &msg, K_NO_WAIT) == 0) {
+			if (msg.buf) {
+				k_sem_give(&ring_space_sem);
+			}
+		}
+	}
+
+	/* Truncate to the actual recorded size, releasing unused pre-allocated
+	 * clusters back to the FAT.  This is done once at the end so the file
+	 * on the drive exactly matches the recorded audio. */
+	{
+		uint32_t data_sz = (uint32_t)atomic_get(&rec_bytes);
+		int tret = fs_truncate(&rec_file,
+				       (off_t)(sizeof(struct wav_hdr) + data_sz));
+
+		if (tret < 0) {
+			LOG_WRN("Truncate to actual size failed (%d)", tret);
+		}
+	}
+
+	/* Seek back and write the final WAV header */
+	{
+		uint32_t data_sz = (uint32_t)atomic_get(&rec_bytes);
+		struct wav_hdr hdr = {
+			.riff        = {'R', 'I', 'F', 'F'},
+			.riff_size   = data_sz + sizeof(struct wav_hdr) - 8,
+			.wave        = {'W', 'A', 'V', 'E'},
+			.fmt_id      = {'f', 'm', 't', ' '},
+			.fmt_size    = 16,
+			.audio_fmt   = 1,
+			.channels    = NUM_CHANNELS,
+			.sample_rate = SAMPLE_RATE,
+			.byte_rate   = SAMPLE_RATE * NUM_CHANNELS * BYTES_PER_SAMPLE,
+			.block_align = NUM_CHANNELS * BYTES_PER_SAMPLE,
+			.bits        = BITS_PER_SAMPLE,
+			.data_id     = {'d', 'a', 't', 'a'},
+			.data_size   = data_sz,
+		};
+
+		fs_seek(&rec_file, 0, FS_SEEK_SET);
+		fs_write(&rec_file, &hdr, sizeof(hdr));
+	}
+
+	fs_close(&rec_file);
+	fs_unmount(&rec_mnt);
+	regulator_disable(DEVICE_DT_GET(DT_NODELABEL(mic_pwr)));
+
+	{
+		uint32_t total = (uint32_t)atomic_get(&rec_bytes);
+		uint32_t ms    = total * 1000U /
+				 (SAMPLE_RATE * NUM_CHANNELS * BYTES_PER_SAMPLE);
+
+		LOG_INF("Recording saved: %u bytes (%u.%03u s)",
+			total, ms / 1000U, ms % 1000U);
+	}
+
+	k_mutex_lock(&rec_mutex, K_FOREVER);
+	rec_active = false;
+	k_mutex_unlock(&rec_mutex);
+}
+
+/* ===========================================================================
+ * Shell commands
+ * =========================================================================== */
+
+static int cmd_record_start(const struct shell *sh, size_t argc, char **argv)
+{
+	k_mutex_lock(&rec_mutex, K_FOREVER);
+
+	if (rec_active) {
+		shell_error(sh, "Already recording -- use 'record stop' first");
+		k_mutex_unlock(&rec_mutex);
+		return -EBUSY;
+	}
+
+	uint32_t max_sec = 0;
+
+	if (argc >= 2) {
+		long v = strtol(argv[1], NULL, 10);
+
+		if (v > 0) {
+			max_sec = (uint32_t)v;
+		}
+	}
+
+	const struct device *mic = DEVICE_DT_GET(DT_NODELABEL(mic_pwr));
+
+	if (!device_is_ready(mic)) {
+		shell_error(sh, "Mic power regulator not ready");
+		k_mutex_unlock(&rec_mutex);
+		return -ENODEV;
+	}
+
+	int ret = regulator_enable(mic);
 
 	if (ret < 0) {
-		LOG_ERR("fs_open(%s) failed: %d", path, ret);
+		shell_error(sh, "regulator_enable: %d", ret);
+		k_mutex_unlock(&rec_mutex);
+		return ret;
+	}
+	k_sleep(K_MSEC(100));
+
+	ret = fs_mount(&rec_mnt);
+	if (ret < 0) {
+		shell_error(sh, "fs_mount: %d", ret);
+		regulator_disable(mic);
+		k_mutex_unlock(&rec_mutex);
 		return ret;
 	}
 
-	ssize_t written = fs_write(&file, &hdr, sizeof(hdr));
+	/* Find next free recNNNN.wav */
+	char path[32];
+	int i;
 
-	if (written < 0) {
-		LOG_ERR("Failed to write WAV header: %zd", written);
-		fs_close(&file);
-		return (int)written;
+	for (i = 1; i <= 9999; i++) {
+		snprintf(path, sizeof(path), "/NAND:/rec%04d.wav", i);
+		struct fs_dirent de;
+
+		if (fs_stat(path, &de) == -ENOENT) {
+			break;
+		}
+	}
+	if (i > 9999) {
+		shell_error(sh, "No free filename (delete old recordings)");
+		fs_unmount(&rec_mnt);
+		regulator_disable(mic);
+		k_mutex_unlock(&rec_mutex);
+		return -ENOSPC;
 	}
 
-	written = fs_write(&file, audio_buf, AUDIO_BYTES);
-	if (written < 0) {
-		LOG_ERR("Failed to write audio data: %zd", written);
-		fs_close(&file);
-		return (int)written;
+	fs_file_t_init(&rec_file);
+	ret = fs_open(&rec_file, path, FS_O_CREATE | FS_O_WRITE | FS_O_TRUNC);
+	if (ret < 0) {
+		shell_error(sh, "fs_open: %d", ret);
+		fs_unmount(&rec_mnt);
+		regulator_disable(mic);
+		k_mutex_unlock(&rec_mutex);
+		return ret;
 	}
 
-	return fs_close(&file);
+	/* Write a zeroed placeholder header; sizes filled in by write_thread */
+	static const uint8_t placeholder[sizeof(struct wav_hdr)];
+
+	fs_write(&rec_file, placeholder, sizeof(placeholder));
+
+	/* Pre-allocate all clusters upfront so that no FAT-chain updates happen
+	 * during recording.  This makes every audio write hit an already-allocated
+	 * cluster, eliminating the additional flash erases that otherwise cause
+	 * the ring buffer to fill and audio blocks to be dropped.
+	 *
+	 * f_lseek in write mode extends the cluster chain without writing any
+	 * data (~1-2 FAT sector flushes, ≈ 72 ms for 60 s).  The file is then
+	 * truncated down to the actual recorded size on stop. */
+	{
+		uint32_t prealloc_s = (rec_max_bytes > 0)
+			? (uint32_t)((uint64_t)rec_max_bytes /
+				     (SAMPLE_RATE * NUM_CHANNELS * BYTES_PER_SAMPLE)) + 1U
+			: 60U;
+		uint32_t prealloc_bytes =
+			prealloc_s * SAMPLE_RATE * NUM_CHANNELS * BYTES_PER_SAMPLE
+			+ sizeof(struct wav_hdr);
+
+		int pret = fs_truncate(&rec_file, prealloc_bytes);
+
+		if (pret < 0) {
+			LOG_WRN("Pre-alloc %u B failed (%d) – recording without "
+				"pre-allocation", prealloc_bytes, pret);
+		}
+		/* Seek back to the audio-data start position regardless */
+		fs_seek(&rec_file, sizeof(struct wav_hdr), FS_SEEK_SET);
+	}
+
+	/* Reset all recording state */
+	atomic_set(&rec_bytes, 0);
+	atomic_set(&rec_bytes_queued, 0);
+	atomic_set(&rec_stop_req, 0);
+	rec_max_bytes = max_sec > 0
+			? max_sec * SAMPLE_RATE * NUM_CHANNELS * BYTES_PER_SAMPLE
+			: 0;
+
+	/* Reset ring buffer */
+	ring_wr_idx = 0;
+	k_sem_init(&ring_space_sem, RING_BLOCKS, RING_BLOCKS);
+	k_msgq_purge(&ring_msgq);
+
+	rec_active = true;
+	k_mutex_unlock(&rec_mutex);
+
+	/* Start PDM reader (priority 5) then FAT writer (priority 7) */
+	k_thread_create(&rec_thread, rec_stack,
+			K_THREAD_STACK_SIZEOF(rec_stack),
+			rec_thread_fn, NULL, NULL, NULL,
+			5, 0, K_NO_WAIT);
+	k_thread_create(&write_thread, write_stack,
+			K_THREAD_STACK_SIZEOF(write_stack),
+			write_thread_fn, NULL, NULL, NULL,
+			7, 0, K_NO_WAIT);
+
+	if (max_sec > 0) {
+		shell_print(sh, "Recording to %s (max %u s) -- "
+			    "use 'record stop' to end early", path, max_sec);
+	} else {
+		shell_print(sh, "Recording to %s -- "
+			    "use 'record stop' to finish", path);
+	}
+
+	return 0;
 }
 
+static int cmd_record_stop(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	k_mutex_lock(&rec_mutex, K_FOREVER);
+	bool active = rec_active;
+
+	k_mutex_unlock(&rec_mutex);
+
+	if (!active) {
+		shell_error(sh, "Not recording");
+		return -ENODEV;
+	}
+
+	shell_print(sh, "Stopping...");
+	atomic_set(&rec_stop_req, 1);
+
+	/* Wait for PDM reader to stop and send the ring sentinel (fast) */
+	int ret = k_thread_join(&rec_thread, K_SECONDS(5));
+
+	if (ret < 0) {
+		shell_error(sh, "PDM reader join timeout: %d", ret);
+		return ret;
+	}
+
+	/* Wait for FAT writer to drain the ring and close the file (slow) */
+	ret = k_thread_join(&write_thread, K_SECONDS(30));
+	if (ret < 0) {
+		shell_error(sh, "FAT writer join timeout: %d", ret);
+		return ret;
+	}
+
+	uint32_t total = (uint32_t)atomic_get(&rec_bytes);
+	uint32_t ms    = total * 1000U /
+			 (SAMPLE_RATE * NUM_CHANNELS * BYTES_PER_SAMPLE);
+
+	shell_print(sh, "Saved %u bytes (%u.%03u s)", total, ms / 1000U, ms % 1000U);
+	return 0;
+}
+
+static int cmd_record_status(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	k_mutex_lock(&rec_mutex, K_FOREVER);
+	bool active = rec_active;
+
+	k_mutex_unlock(&rec_mutex);
+
+	if (active) {
+		/* rec_bytes_queued tracks what the PDM reader has captured;
+		 * rec_bytes tracks what the FAT writer has flushed (lags by
+		 * up to RING_BLOCKS blocks during fast recordings). */
+		uint32_t captured = (uint32_t)atomic_get(&rec_bytes_queued);
+		uint32_t written  = (uint32_t)atomic_get(&rec_bytes);
+		uint32_t ms = captured * 1000U /
+			      (SAMPLE_RATE * NUM_CHANNELS * BYTES_PER_SAMPLE);
+
+		shell_print(sh, "Recording: %u B captured, %u B written (%u.%03u s)",
+			    captured, written, ms / 1000U, ms % 1000U);
+	} else {
+		shell_print(sh, "Idle");
+	}
+
+	return 0;
+}
+
+SHELL_STATIC_SUBCMD_SET_CREATE(sub_record,
+	SHELL_CMD_ARG(start, NULL,
+		      "[max_seconds]  Start recording to recNNNN.wav",
+		      cmd_record_start, 1, 1),
+	SHELL_CMD_ARG(stop, NULL,
+		      "Stop recording and write WAV header",
+		      cmd_record_stop, 1, 0),
+	SHELL_CMD_ARG(status, NULL,
+		      "Show recording state and elapsed time",
+		      cmd_record_status, 1, 0),
+	SHELL_SUBCMD_SET_END
+);
+SHELL_CMD_REGISTER(record, &sub_record, "PDM WAV recorder", NULL);
+
 /* ===========================================================================
- * main
+
+/* ===========================================================================
+ * main -- init disk and USB, then idle (shell runs in its own context)
  * =========================================================================== */
 
 int main(void)
 {
-	int ret;
+int ret;
 
-	/* 1. Initialise the QSPI flash disk ---------------------------------- */
-	ret = disk_access_init("NAND");
-	if (ret) {
-		LOG_ERR("Failed to initialise NAND disk (%d)", ret);
-		return ret;
-	}
+ret = disk_access_init("NAND");
+if (ret) {
+LOG_ERR("disk_access_init: %d", ret);
+return ret;
+}
 
-	/* 2. Power up the PDM microphone ------------------------------------- */
-	const struct device *mic_pwr = DEVICE_DT_GET(DT_NODELABEL(mic_pwr));
-
-	if (!device_is_ready(mic_pwr)) {
-		LOG_ERR("Mic power regulator not ready");
-		return -ENODEV;
-	}
-	ret = regulator_enable(mic_pwr);
-	if (ret < 0) {
-		LOG_ERR("Failed to enable mic power: %d", ret);
-		return ret;
-	}
-	k_sleep(K_MSEC(100)); /* wait for rail and mic to stabilise */
-
-	/* 3. Mount FAT -------------------------------------------------------
-	 * CONFIG_FS_FATFS_MOUNT_MKFS=y auto-formats on first use.
-	 * --------------------------------------------------------------------- */
-	static FATFS fat_fs;
-	static struct fs_mount_t mnt = {
-		.type      = FS_FATFS,
-		.fs_data   = &fat_fs,
-		.mnt_point = "/NAND:",
-	};
-
-	ret = fs_mount(&mnt);
-	if (ret < 0) {
-		LOG_ERR("fs_mount failed (%d) – connect USB and format drive", ret);
-		goto usb_init;
-	}
-	LOG_INF("FAT mounted on %s", mnt.mnt_point);
-
-	/* 4. Record 1 second ------------------------------------------------- */
-	LOG_INF("Recording %u s at %u Hz...", RECORD_SECONDS, SAMPLE_RATE);
-	ret = record_audio();
-	if (ret < 0) {
-		LOG_ERR("Recording failed: %d", ret);
-		goto unmount;
-	}
-	LOG_INF("Recording complete (%u B captured)", AUDIO_BYTES);
-
-	/* 5. Save WAV -------------------------------------------------------- */
-	ret = save_wav("/NAND:/record.wav");
-	if (ret < 0) {
-		LOG_ERR("Failed to save WAV: %d", ret);
-	} else {
-		LOG_INF("Saved /NAND:/record.wav");
-	}
-
-unmount:
-	/* 6. Unmount before handing disk to USB MSC -------------------------- */
-	fs_unmount(&mnt);
-	LOG_INF("FAT unmounted");
-
-	/* 7. Mic power off --------------------------------------------------- */
-	regulator_disable(mic_pwr);
-
-usb_init:
-	/* 8. Bring up USB (MSC + CDC-ACM console) ---------------------------- */
-	ret = usbd_add_descriptor(&usbd_msc_dev, &usbd_lang);
-	if (ret) {
-		LOG_ERR("Failed to add language descriptor (%d)", ret);
-		return ret;
-	}
-
-	ret = usbd_add_descriptor(&usbd_msc_dev, &usbd_mfr);
-	if (ret) {
-		LOG_ERR("Failed to add manufacturer descriptor (%d)", ret);
-		return ret;
-	}
-
-	ret = usbd_add_descriptor(&usbd_msc_dev, &usbd_product);
-	if (ret) {
-		LOG_ERR("Failed to add product descriptor (%d)", ret);
-		return ret;
-	}
-
+ret = usbd_add_descriptor(&usbd_msc_dev, &usbd_lang);
+if (ret) {
+LOG_ERR("lang descriptor: %d", ret);
+return ret;
+}
+ret = usbd_add_descriptor(&usbd_msc_dev, &usbd_mfr);
+if (ret) {
+LOG_ERR("mfr descriptor: %d", ret);
+return ret;
+}
+ret = usbd_add_descriptor(&usbd_msc_dev, &usbd_product);
+if (ret) {
+LOG_ERR("product descriptor: %d", ret);
+return ret;
+}
 #if defined(CONFIG_HWINFO)
-	ret = usbd_add_descriptor(&usbd_msc_dev, &usbd_sn);
-	if (ret) {
-		LOG_ERR("Failed to add serial number descriptor (%d)", ret);
-		return ret;
-	}
+ret = usbd_add_descriptor(&usbd_msc_dev, &usbd_sn);
+if (ret) {
+LOG_ERR("sn descriptor: %d", ret);
+return ret;
+}
 #endif
-
-	ret = usbd_add_configuration(&usbd_msc_dev, USBD_SPEED_FS,
-				     &usbd_fs_config);
-	if (ret) {
-		LOG_ERR("Failed to add FS configuration (%d)", ret);
-		return ret;
-	}
-
-	ret = usbd_register_all_classes(&usbd_msc_dev, USBD_SPEED_FS, 1,
-					usbd_blocklist);
-	if (ret) {
-		LOG_ERR("Failed to register USB classes (%d)", ret);
-		return ret;
-	}
-
+ret = usbd_add_configuration(&usbd_msc_dev, USBD_SPEED_FS,
+     &usbd_fs_config);
+if (ret) {
+LOG_ERR("add_configuration: %d", ret);
+return ret;
+}
+ret = usbd_register_all_classes(&usbd_msc_dev, USBD_SPEED_FS, 1,
+usbd_blocklist);
+if (ret) {
+LOG_ERR("register_all_classes: %d", ret);
+return ret;
+}
 #if defined(CONFIG_USBD_CDC_ACM_CLASS)
-	ret = usbd_device_set_code_triple(&usbd_msc_dev, USBD_SPEED_FS,
-					  USB_BCC_MISCELLANEOUS, 0x02, 0x01);
-	if (ret) {
-		LOG_ERR("Failed to set composite class triple (%d)", ret);
-		return ret;
-	}
+ret = usbd_device_set_code_triple(&usbd_msc_dev, USBD_SPEED_FS,
+  USB_BCC_MISCELLANEOUS, 0x02, 0x01);
+if (ret) {
+LOG_ERR("set_code_triple: %d", ret);
+return ret;
+}
 #endif
+ret = usbd_init(&usbd_msc_dev);
+if (ret) {
+LOG_ERR("usbd_init: %d", ret);
+return ret;
+}
+ret = usbd_enable(&usbd_msc_dev);
+if (ret) {
+LOG_ERR("usbd_enable: %d", ret);
+return ret;
+}
 
-	ret = usbd_init(&usbd_msc_dev);
-	if (ret) {
-		LOG_ERR("Failed to initialise USB device (%d)", ret);
-		return ret;
-	}
+LOG_INF("XIAO BLE Microphone ready (app %s) -- "
+"connect USB and open the serial port", APP_VERSION_STRING);
 
-	ret = usbd_enable(&usbd_msc_dev);
-	if (ret) {
-		LOG_ERR("Failed to enable USB device (%d)", ret);
-		return ret;
-	}
+while (true) {
+k_sleep(K_SECONDS(1));
+}
 
-	LOG_INF("XIAO BLE Flash Disk ready (app %s)", APP_VERSION_STRING);
-
-	while (true) {
-		k_sleep(K_SECONDS(1));
-	}
-
-	return 0;
+return 0;
 }
