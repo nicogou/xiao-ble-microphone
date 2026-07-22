@@ -275,6 +275,11 @@ static void write_thread_fn(void *p1, void *p2, void *p3)
 	ARG_UNUSED(p2);
 	ARG_UNUSED(p3);
 
+	/* Set to false on the first write error so we stop hammering fs_write
+	 * while still draining the ring (semaphore slots must be returned so
+	 * the ring is reusable for the next recording session). */
+	bool write_ok = true;
+
 	while (true) {
 		struct ring_msg msg;
 
@@ -284,15 +289,30 @@ static void write_thread_fn(void *p1, void *p2, void *p3)
 			break;  /* NULL sentinel = PDM reader has finished */
 		}
 
-		ssize_t written = fs_write(&rec_file, msg.buf, msg.size);
+		if (write_ok) {
+			ssize_t written = fs_write(&rec_file, msg.buf, msg.size);
 
-		k_sem_give(&ring_space_sem);  /* return the ring slot */
-
-		if (written >= 0) {
-			atomic_add(&rec_bytes, (atomic_val_t)written);
-		} else {
-			LOG_ERR("fs_write: %zd (flash full?)", written);
+			if (written == (ssize_t)msg.size) {
+				/* Full block written – normal path */
+				atomic_add(&rec_bytes, (atomic_val_t)written);
+			} else {
+				/* Partial write (ELM FAT ran out of clusters
+				 * mid-block and returned FR_OK with bw < btw)
+				 * OR a hard write error (written < 0).
+				 * Either way the disk is full. */
+				if (written > 0) {
+					atomic_add(&rec_bytes,
+						   (atomic_val_t)written);
+				}
+				LOG_WRN("Storage full (%zd/%u B written) "
+					"– stopping recording",
+					written, msg.size);
+				atomic_set(&rec_stop_req, 1);
+				write_ok = false;
+			}
 		}
+
+		k_sem_give(&ring_space_sem);  /* always return the ring slot */
 	}
 
 	/* Drain any leftover messages (e.g. after a write error) */
