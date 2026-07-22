@@ -439,37 +439,73 @@ static int cmd_record_start(const struct shell *sh, size_t argc, char **argv)
 		return ret;
 	}
 
-	/* Write a zeroed placeholder header; sizes filled in by write_thread */
+	/* Pre-allocate clusters with f_expand BEFORE writing any data.
+	 * f_expand requires fp->fsize == 0, so it must run on the empty file.
+	 *
+	 * Query free space first so we never request more clusters than are
+	 * actually available (which causes FR_DENIED on a non-empty disk).
+	 * We clamp the pre-allocation to the available space minus one cluster
+	 * reserve, and also to the requested max duration if one was given.
+	 *
+	 * f_expand with opt=1 (contiguous) automatically falls back to
+	 * non-contiguous allocation when no single contiguous block exists.
+	 * The file pointer is unchanged after the call (stays at 0), so
+	 * writing the placeholder header below advances it to sizeof(wav_hdr)
+	 * -- exactly where audio data should start. */
+	{
+		struct fs_statvfs sv;
+		FSIZE_t prealloc_bytes = 0;
+
+		if (fs_statvfs(rec_mnt.mnt_point, &sv) == 0 && sv.f_bfree > 1U) {
+			/* Leave 1 cluster as a reserve so the FAT never runs
+			 * completely full (needed for directory-entry writes). */
+			uint64_t avail = (uint64_t)(sv.f_bfree - 1U) * sv.f_frsize;
+
+			/* Desired size: user-requested max + 1 s margin, or all
+			 * available space if no limit was given. */
+			uint64_t wanted = (max_sec > 0U)
+				? (uint64_t)(max_sec + 1U) *
+				  SAMPLE_RATE * NUM_CHANNELS * BYTES_PER_SAMPLE
+				  + sizeof(struct wav_hdr)
+				: avail;
+
+			uint64_t alloc = MIN(avail, wanted);
+
+			if (max_sec > 0U && avail < wanted) {
+				uint32_t avail_s = (uint32_t)(
+					avail / (SAMPLE_RATE * NUM_CHANNELS
+						 * BYTES_PER_SAMPLE));
+				LOG_WRN("Only %u s of free space, clamping "
+					"pre-alloc from %u s",
+					avail_s, max_sec);
+			}
+
+			/* Only bother if we can secure at least 5 s */
+			if (alloc >= (uint64_t)5U * SAMPLE_RATE *
+					 NUM_CHANNELS * BYTES_PER_SAMPLE) {
+				prealloc_bytes = (FSIZE_t)alloc;
+			}
+		}
+
+		if (prealloc_bytes > 0) {
+			FRESULT fr = f_expand(
+				(FIL *)rec_file.filep, prealloc_bytes, 1);
+
+			if (fr != FR_OK) {
+				LOG_WRN("f_expand failed (%u) - recording "
+					"without pre-allocation", (unsigned)fr);
+			}
+		} else {
+			LOG_WRN("Insufficient free space for pre-allocation");
+		}
+	}
+
+	/* Write a zeroed placeholder header at position 0.
+	 * After this write the file pointer is at sizeof(wav_hdr), ready for
+	 * audio data.  The final WAV header is written by write_thread on stop. */
 	static const uint8_t placeholder[sizeof(struct wav_hdr)];
 
 	fs_write(&rec_file, placeholder, sizeof(placeholder));
-
-	/* Pre-allocate all clusters upfront so that no FAT-chain updates happen
-	 * during recording.  This makes every audio write hit an already-allocated
-	 * cluster, eliminating the additional flash erases that otherwise cause
-	 * the ring buffer to fill and audio blocks to be dropped.
-	 *
-	 * f_lseek in write mode extends the cluster chain without writing any
-	 * data (~1-2 FAT sector flushes, ≈ 72 ms for 60 s).  The file is then
-	 * truncated down to the actual recorded size on stop. */
-	{
-		uint32_t prealloc_s = (rec_max_bytes > 0)
-			? (uint32_t)((uint64_t)rec_max_bytes /
-				     (SAMPLE_RATE * NUM_CHANNELS * BYTES_PER_SAMPLE)) + 1U
-			: 60U;
-		uint32_t prealloc_bytes =
-			prealloc_s * SAMPLE_RATE * NUM_CHANNELS * BYTES_PER_SAMPLE
-			+ sizeof(struct wav_hdr);
-
-		int pret = fs_truncate(&rec_file, prealloc_bytes);
-
-		if (pret < 0) {
-			LOG_WRN("Pre-alloc %u B failed (%d) – recording without "
-				"pre-allocation", prealloc_bytes, pret);
-		}
-		/* Seek back to the audio-data start position regardless */
-		fs_seek(&rec_file, sizeof(struct wav_hdr), FS_SEEK_SET);
-	}
 
 	/* Reset all recording state */
 	atomic_set(&rec_bytes, 0);
@@ -590,8 +626,6 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_record,
 	SHELL_SUBCMD_SET_END
 );
 SHELL_CMD_REGISTER(record, &sub_record, "PDM WAV recorder", NULL);
-
-/* ===========================================================================
 
 /* ===========================================================================
  * main -- init disk and USB, then idle (shell runs in its own context)
