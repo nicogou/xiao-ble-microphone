@@ -17,6 +17,7 @@
 #include <ff.h>
 
 #include <app_version.h>
+#include "kws.h"
 
 LOG_MODULE_REGISTER(main, CONFIG_APP_LOG_LEVEL);
 
@@ -381,6 +382,18 @@ static void write_thread_fn(void *p1, void *p2, void *p3)
 }
 
 /* ===========================================================================
+ * rec_is_active() – queried by kws.cpp to prevent simultaneous use of the mic
+ * =========================================================================== */
+
+bool rec_is_active(void)
+{
+	k_mutex_lock(&rec_mutex, K_FOREVER);
+	bool a = rec_active;
+	k_mutex_unlock(&rec_mutex);
+	return a;
+}
+
+/* ===========================================================================
  * Shell commands
  * =========================================================================== */
 
@@ -390,6 +403,12 @@ static int cmd_record_start(const struct shell *sh, size_t argc, char **argv)
 
 	if (rec_active) {
 		shell_error(sh, "Already recording -- use 'record stop' first");
+		k_mutex_unlock(&rec_mutex);
+		return -EBUSY;
+	}
+
+	if (kws_is_active()) {
+		shell_error(sh, "KWS is running -- use 'kws stop' first");
 		k_mutex_unlock(&rec_mutex);
 		return -EBUSY;
 	}

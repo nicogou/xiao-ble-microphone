@@ -1,0 +1,5 @@
+name: Tutorial_Responding_to_your_voic v115
+build:
+  cmake: .
+  depends:
+    - edge-impulse-sdk-zephyr
