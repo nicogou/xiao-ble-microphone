@@ -20,6 +20,7 @@
  */
 
 #include "kws.h"
+#include "pitch.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -300,6 +301,12 @@ static int cmd_kws_start(const struct shell *sh, size_t argc, char **argv)
 
     if (rec_is_active()) {
         shell_error(sh, "WAV recording in progress -- use 'record stop' first");
+        k_mutex_unlock(&kws_mutex);
+        return -EBUSY;
+    }
+
+    if (pitch_is_active()) {
+        shell_error(sh, "Pitch detection is running -- use 'pitch stop' first");
         k_mutex_unlock(&kws_mutex);
         return -EBUSY;
     }

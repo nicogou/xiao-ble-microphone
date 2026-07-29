@@ -18,6 +18,7 @@
 
 #include <app_version.h>
 #include "kws.h"
+#include "pitch.h"
 
 LOG_MODULE_REGISTER(main, CONFIG_APP_LOG_LEVEL);
 
@@ -409,6 +410,12 @@ static int cmd_record_start(const struct shell *sh, size_t argc, char **argv)
 
 	if (kws_is_active()) {
 		shell_error(sh, "KWS is running -- use 'kws stop' first");
+		k_mutex_unlock(&rec_mutex);
+		return -EBUSY;
+	}
+
+	if (pitch_is_active()) {
+		shell_error(sh, "Pitch detection is running -- use 'pitch stop' first");
 		k_mutex_unlock(&rec_mutex);
 		return -EBUSY;
 	}
