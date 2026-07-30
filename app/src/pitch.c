@@ -97,7 +97,7 @@ static K_MUTEX_DEFINE(pitch_mutex);
 static bool      pitch_active;
 static atomic_t  pitch_stop_req = ATOMIC_INIT(0);
 
-#define PITCH_STACK_SIZE 4096
+#define PITCH_STACK_SIZE 2048
 static K_THREAD_STACK_DEFINE(pitch_stack, PITCH_STACK_SIZE);
 static struct k_thread pitch_thread;
 

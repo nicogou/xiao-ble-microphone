@@ -29,9 +29,10 @@ LOG_MODULE_REGISTER(main, CONFIG_APP_LOG_LEVEL);
 #define AUDIO_BYTES_PER_SEC  (MIC_SAMPLE_RATE * MIC_CHANNELS * (MIC_BITS / 8U))
 
 /* Ring buffer between the PDM reader thread and the FAT writer thread.
- * 20 slots × 3200 B = 64 000 B ≈ 2 s – absorbs all flash-write and USB-MSC
- * latency spikes without ever blocking the PDM read path. */
-#define RING_BLOCKS 20U
+ * 8 slots × 3200 B = 25 600 B ≈ 800 ms – absorbs flash-write and USB-MSC
+ * latency spikes.  Blocks that arrive while the ring is full are dropped
+ * with a warning; the recording stays alive. */
+#define RING_BLOCKS 8U
 static uint8_t ring_buf[RING_BLOCKS][MIC_BLOCK_BYTES];
 static int     ring_wr_idx;
 static K_SEM_DEFINE(ring_space_sem, RING_BLOCKS, RING_BLOCKS);
@@ -99,7 +100,7 @@ static atomic_t  rec_stop_req     = ATOMIC_INIT(0);
 static uint32_t  rec_max_bytes;
 
 /* PDM reader thread (high priority – keeps up with hardware) */
-#define REC_STACK_SIZE 4096
+#define REC_STACK_SIZE 2048
 static K_THREAD_STACK_DEFINE(rec_stack, REC_STACK_SIZE);
 static struct k_thread rec_thread;
 

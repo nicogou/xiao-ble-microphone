@@ -14,10 +14,10 @@
 LOG_MODULE_REGISTER(mic, CONFIG_APP_LOG_LEVEL);
 
 /*
- * Shared slab sized for the recording use case (largest consumer):
- *   hardware double-buffering (2) + rx_queue (4) + reader hold (1) + spare (3)
+ * 8 blocks: hardware double-buffering (2) + driver rx-queue (4) + reader
+ * hold (1) + 1 spare.  Only one mode runs at a time so this covers all cases.
  */
-#define MIC_SLAB_BLOCKS 10U
+#define MIC_SLAB_BLOCKS 8U
 K_MEM_SLAB_DEFINE_STATIC(mic_slab, MIC_BLOCK_BYTES, MIC_SLAB_BLOCKS, 4);
 
 static const struct device *mic_dmic;
