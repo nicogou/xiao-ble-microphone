@@ -40,12 +40,8 @@
 
 LOG_MODULE_REGISTER(kws, CONFIG_APP_LOG_LEVEL);
 
-/*
- * rec_is_active() is implemented in main.c (C linkage).
- * It lets the KWS start command refuse to start when a WAV recording is in
- * progress (both modes share the PDM microphone and mic-power regulator).
- */
-extern "C" bool rec_is_active(void);
+#include "rec.h"
+#include "pitch.h"
 
 /* =========================================================================
  * Inference slice buffer.

@@ -17,6 +17,7 @@ project(app LANGUAGES C CXX)
 
 target_sources(app PRIVATE
     src/main.c
+    src/rec.c
     src/mic.c
     src/kws.cpp
     src/pitch.c

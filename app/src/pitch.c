@@ -34,9 +34,8 @@
 
 LOG_MODULE_REGISTER(pitch, CONFIG_APP_LOG_LEVEL);
 
-/* Peer-mode query functions (defined in main.c / kws.cpp) */
-extern bool rec_is_active(void);
-extern bool kws_is_active(void);
+#include "rec.h"
+#include "kws.h"
 
 /* =========================================================================
  * Analysis parameters
