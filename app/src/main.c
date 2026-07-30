@@ -12,9 +12,8 @@
 #include <zephyr/usb/class/usbd_msc.h>
 #include <zephyr/storage/disk_access.h>
 #include <zephyr/fs/fs.h>
-#include <zephyr/audio/dmic.h>
-#include <zephyr/drivers/regulator.h>
 #include <ff.h>
+#include "mic.h"
 
 #include <app_version.h>
 #include "kws.h"
@@ -26,28 +25,14 @@ LOG_MODULE_REGISTER(main, CONFIG_APP_LOG_LEVEL);
  * Audio / PDM configuration
  * =========================================================================== */
 
-#define SAMPLE_RATE      16000U
-#define NUM_CHANNELS     1U
-#define BITS_PER_SAMPLE  16U
-#define BYTES_PER_SAMPLE (BITS_PER_SAMPLE / 8U)
-
-/* 100 ms PDM blocks.
- * With the two-thread design the PDM reader frees each slab block almost
- * immediately (just a memcpy into the ring buffer).  The slab only needs to
- * cover hardware double-buffering (always 2) plus the rx_queue (queue-size=4)
- * plus 1 briefly held by the reader, plus 1 spare: 2+4+1+1 = 8.
- * We use 10 for a little extra margin. */
-#define BLOCK_MS        100U
-#define BLOCK_SAMPLES   (SAMPLE_RATE * BLOCK_MS / 1000U)
-#define BLOCK_BYTES     (BLOCK_SAMPLES * NUM_CHANNELS * BYTES_PER_SAMPLE)
-#define SLAB_NUM_BLOCKS 10U
-K_MEM_SLAB_DEFINE_STATIC(pdm_mem_slab, BLOCK_BYTES, SLAB_NUM_BLOCKS, 4);
+/* Bytes per second of mono 16-bit 16 kHz PCM – used for WAV math. */
+#define AUDIO_BYTES_PER_SEC  (MIC_SAMPLE_RATE * MIC_CHANNELS * (MIC_BITS / 8U))
 
 /* Ring buffer between the PDM reader thread and the FAT writer thread.
  * 20 slots × 3200 B = 64 000 B ≈ 2 s – absorbs all flash-write and USB-MSC
  * latency spikes without ever blocking the PDM read path. */
 #define RING_BLOCKS 20U
-static uint8_t ring_buf[RING_BLOCKS][BLOCK_BYTES];
+static uint8_t ring_buf[RING_BLOCKS][MIC_BLOCK_BYTES];
 static int     ring_wr_idx;
 static K_SEM_DEFINE(ring_space_sem, RING_BLOCKS, RING_BLOCKS);
 
@@ -132,10 +117,60 @@ static struct fs_mount_t rec_mnt = {
 };
 
 /* ===========================================================================
+ * PDM block callback for the recording mode.
+ *
+ * Clamps the block to the max-duration limit, copies it into the ring buffer,
+ * and posts it to the FAT writer.  K_NO_WAIT on the semaphore means a full
+ * ring (writer stalled by flash or USB) causes a block drop rather than
+ * blocking the PDM acquisition path.
+ * =========================================================================== */
+
+static void rec_pdm_cb(void *buf, uint32_t size, void *user_data)
+{
+	ARG_UNUSED(user_data);
+
+	uint32_t to_copy = size;
+
+	if (rec_max_bytes > 0) {
+		uint32_t queued = (uint32_t)atomic_get(&rec_bytes_queued);
+
+		if (queued >= rec_max_bytes) {
+			mic_block_free(buf);
+			atomic_set(&rec_stop_req, 1);
+			return;
+		}
+		uint32_t remaining = rec_max_bytes - queued;
+
+		if (to_copy > remaining) {
+			to_copy = remaining;
+		}
+	}
+
+	if (k_sem_take(&ring_space_sem, K_NO_WAIT) != 0) {
+		LOG_WRN("Ring full - dropping PDM block (flash/USB busy)");
+		mic_block_free(buf);
+		return;
+	}
+	memcpy(ring_buf[ring_wr_idx], buf, to_copy);
+	mic_block_free(buf);
+
+	struct ring_msg msg = {.buf = ring_buf[ring_wr_idx], .size = to_copy};
+
+	k_msgq_put(&ring_msgq, &msg, K_NO_WAIT);
+	ring_wr_idx = (ring_wr_idx + 1) % RING_BLOCKS;
+	atomic_add(&rec_bytes_queued, to_copy);
+
+	/* Stop after the last clamped block. */
+	if (rec_max_bytes > 0 &&
+	    (uint32_t)atomic_get(&rec_bytes_queued) >= rec_max_bytes) {
+		atomic_set(&rec_stop_req, 1);
+	}
+}
+
+/* ===========================================================================
  * PDM reader thread
- * Reads blocks from the PDM driver and copies them into the ring buffer.
- * The slab block is freed immediately after the copy so the driver never
- * stalls waiting for a free slab slot.
+ * Opens the shared mic layer, runs the read loop, then sends a sentinel to
+ * the FAT writer.
  * =========================================================================== */
 
 static void rec_thread_fn(void *p1, void *p2, void *p3)
@@ -144,119 +179,14 @@ static void rec_thread_fn(void *p1, void *p2, void *p3)
 	ARG_UNUSED(p2);
 	ARG_UNUSED(p3);
 
-	const struct device *dmic = DEVICE_DT_GET(DT_NODELABEL(pdm0));
-	int ret;
-
-	struct pcm_stream_cfg stream = {
-		.pcm_width  = BITS_PER_SAMPLE,
-		.pcm_rate   = SAMPLE_RATE,
-		.block_size = BLOCK_BYTES,
-		.mem_slab   = &pdm_mem_slab,
-	};
-	struct dmic_cfg cfg = {
-		.io = {
-			.min_pdm_clk_freq = 1000000,
-			.max_pdm_clk_freq = 3200000,
-			.min_pdm_clk_dc   = 40,
-			.max_pdm_clk_dc   = 60,
-		},
-		.streams = &stream,
-		.channel = {
-			.req_num_streams = 1,
-			.req_num_chan    = NUM_CHANNELS,
-			.req_chan_map_lo = dmic_build_channel_map(0, 0, PDM_CHAN_LEFT),
-		},
-	};
-
-	ret = dmic_configure(dmic, &cfg);
-	if (ret < 0) {
-		LOG_ERR("dmic_configure: %d", ret);
+	if (mic_open() < 0) {
 		goto send_sentinel;
 	}
 
-	ret = dmic_trigger(dmic, DMIC_TRIGGER_START);
-	if (ret < 0) {
-		LOG_ERR("DMIC START: %d", ret);
-		goto send_sentinel;
-	}
-
-	/* Discard the first block: PDM filter warm-up. */
-	{
-		void *buf;
-		uint32_t size;
-
-		if (dmic_read(dmic, 0, &buf, &size, BLOCK_MS * 2) == 0) {
-			k_mem_slab_free(&pdm_mem_slab, buf);
-		}
-	}
-
-	/* Recording loop ---------------------------------------------------- */
-	while (!atomic_get(&rec_stop_req)) {
-
-		/* Honor the optional max-duration limit */
-		if (rec_max_bytes > 0 &&
-		    (uint32_t)atomic_get(&rec_bytes_queued) >= rec_max_bytes) {
-			break;
-		}
-
-		void *pdm_buf;
-		uint32_t size;
-
-		ret = dmic_read(dmic, 0, &pdm_buf, &size, BLOCK_MS * 2);
-		if (ret < 0) {
-			LOG_ERR("DMIC read: %d", ret);
-			break;
-		}
-
-		/* Clamp the last block to the max-bytes limit */
-		uint32_t to_copy = size;
-
-		if (rec_max_bytes > 0) {
-			uint32_t queued   = (uint32_t)atomic_get(&rec_bytes_queued);
-			uint32_t remaining = rec_max_bytes - queued;
-
-			if (to_copy > remaining) {
-				to_copy = remaining;
-			}
-		}
-
-		/* Copy into ring buffer.  Use K_NO_WAIT so the PDM reader never
-		 * stalls: if the ring is full (FAT writer blocked by a slow flash
-		 * erase or a Windows drive-scan holding the flashdisk mutex), drop
-		 * this block and loop back to dmic_read immediately.  A dropped
-		 * block causes a brief audio glitch but keeps the recording alive
-		 * rather than letting the rx_queue overflow and killing it. */
-		if (k_sem_take(&ring_space_sem, K_NO_WAIT) != 0) {
-			LOG_WRN("Ring full – dropping PDM block (flash/USB busy)");
-			k_mem_slab_free(&pdm_mem_slab, pdm_buf);
-			continue;
-		}
-		memcpy(ring_buf[ring_wr_idx], pdm_buf, to_copy);
-		k_mem_slab_free(&pdm_mem_slab, pdm_buf);
-
-		struct ring_msg msg = {
-			.buf  = ring_buf[ring_wr_idx],
-			.size = to_copy,
-		};
-		k_msgq_put(&ring_msgq, &msg, K_NO_WAIT);
-		ring_wr_idx = (ring_wr_idx + 1) % RING_BLOCKS;
-		atomic_add(&rec_bytes_queued, to_copy);
-	}
-
-	dmic_trigger(dmic, DMIC_TRIGGER_STOP);
-
-	/* Drain any blocks still queued in the driver */
-	{
-		void *buf;
-		uint32_t size;
-
-		while (dmic_read(dmic, 0, &buf, &size, 0) == 0) {
-			k_mem_slab_free(&pdm_mem_slab, buf);
-		}
-	}
+	mic_run(&rec_stop_req, rec_pdm_cb, NULL);
+	mic_close();
 
 send_sentinel:
-	/* Tell the FAT writer there is no more data */
 	{
 		struct ring_msg sentinel = {.buf = NULL, .size = 0};
 
@@ -351,11 +281,11 @@ static void write_thread_fn(void *p1, void *p2, void *p3)
 			.fmt_id      = {'f', 'm', 't', ' '},
 			.fmt_size    = 16,
 			.audio_fmt   = 1,
-			.channels    = NUM_CHANNELS,
-			.sample_rate = SAMPLE_RATE,
-			.byte_rate   = SAMPLE_RATE * NUM_CHANNELS * BYTES_PER_SAMPLE,
-			.block_align = NUM_CHANNELS * BYTES_PER_SAMPLE,
-			.bits        = BITS_PER_SAMPLE,
+			.channels    = MIC_CHANNELS,
+			.sample_rate = MIC_SAMPLE_RATE,
+			.byte_rate   = AUDIO_BYTES_PER_SEC,
+			.block_align = MIC_CHANNELS * (MIC_BITS / 8U),
+			.bits        = MIC_BITS,
 			.data_id     = {'d', 'a', 't', 'a'},
 			.data_size   = data_sz,
 		};
@@ -366,12 +296,10 @@ static void write_thread_fn(void *p1, void *p2, void *p3)
 
 	fs_close(&rec_file);
 	fs_unmount(&rec_mnt);
-	regulator_disable(DEVICE_DT_GET(DT_NODELABEL(mic_pwr)));
 
 	{
 		uint32_t total = (uint32_t)atomic_get(&rec_bytes);
-		uint32_t ms    = total * 1000U /
-				 (SAMPLE_RATE * NUM_CHANNELS * BYTES_PER_SAMPLE);
+		uint32_t ms    = total * 1000U / AUDIO_BYTES_PER_SEC;
 
 		LOG_INF("Recording saved: %u bytes (%u.%03u s)",
 			total, ms / 1000U, ms % 1000U);
@@ -430,27 +358,10 @@ static int cmd_record_start(const struct shell *sh, size_t argc, char **argv)
 		}
 	}
 
-	const struct device *mic = DEVICE_DT_GET(DT_NODELABEL(mic_pwr));
+	int ret = fs_mount(&rec_mnt);
 
-	if (!device_is_ready(mic)) {
-		shell_error(sh, "Mic power regulator not ready");
-		k_mutex_unlock(&rec_mutex);
-		return -ENODEV;
-	}
-
-	int ret = regulator_enable(mic);
-
-	if (ret < 0) {
-		shell_error(sh, "regulator_enable: %d", ret);
-		k_mutex_unlock(&rec_mutex);
-		return ret;
-	}
-	k_sleep(K_MSEC(100));
-
-	ret = fs_mount(&rec_mnt);
 	if (ret < 0) {
 		shell_error(sh, "fs_mount: %d", ret);
-		regulator_disable(mic);
 		k_mutex_unlock(&rec_mutex);
 		return ret;
 	}
@@ -470,7 +381,6 @@ static int cmd_record_start(const struct shell *sh, size_t argc, char **argv)
 	if (i > 9999) {
 		shell_error(sh, "No free filename (delete old recordings)");
 		fs_unmount(&rec_mnt);
-		regulator_disable(mic);
 		k_mutex_unlock(&rec_mutex);
 		return -ENOSPC;
 	}
@@ -480,7 +390,6 @@ static int cmd_record_start(const struct shell *sh, size_t argc, char **argv)
 	if (ret < 0) {
 		shell_error(sh, "fs_open: %d", ret);
 		fs_unmount(&rec_mnt);
-		regulator_disable(mic);
 		k_mutex_unlock(&rec_mutex);
 		return ret;
 	}
@@ -510,25 +419,22 @@ static int cmd_record_start(const struct shell *sh, size_t argc, char **argv)
 			/* Desired size: user-requested max + 1 s margin, or all
 			 * available space if no limit was given. */
 			uint64_t wanted = (max_sec > 0U)
-				? (uint64_t)(max_sec + 1U) *
-				  SAMPLE_RATE * NUM_CHANNELS * BYTES_PER_SAMPLE
+				? (uint64_t)(max_sec + 1U) * AUDIO_BYTES_PER_SEC
 				  + sizeof(struct wav_hdr)
 				: avail;
 
 			uint64_t alloc = MIN(avail, wanted);
 
 			if (max_sec > 0U && avail < wanted) {
-				uint32_t avail_s = (uint32_t)(
-					avail / (SAMPLE_RATE * NUM_CHANNELS
-						 * BYTES_PER_SAMPLE));
+				uint32_t avail_s = (uint32_t)(avail / AUDIO_BYTES_PER_SEC);
+
 				LOG_WRN("Only %u s of free space, clamping "
 					"pre-alloc from %u s",
 					avail_s, max_sec);
 			}
 
 			/* Only bother if we can secure at least 5 s */
-			if (alloc >= (uint64_t)5U * SAMPLE_RATE *
-					 NUM_CHANNELS * BYTES_PER_SAMPLE) {
+			if (alloc >= (uint64_t)5U * AUDIO_BYTES_PER_SEC) {
 				prealloc_bytes = (FSIZE_t)alloc;
 			}
 		}
@@ -557,9 +463,7 @@ static int cmd_record_start(const struct shell *sh, size_t argc, char **argv)
 	atomic_set(&rec_bytes, 0);
 	atomic_set(&rec_bytes_queued, 0);
 	atomic_set(&rec_stop_req, 0);
-	rec_max_bytes = max_sec > 0
-			? max_sec * SAMPLE_RATE * NUM_CHANNELS * BYTES_PER_SAMPLE
-			: 0;
+	rec_max_bytes = max_sec > 0 ? max_sec * AUDIO_BYTES_PER_SEC : 0;
 
 	/* Reset ring buffer */
 	ring_wr_idx = 0;
@@ -624,8 +528,7 @@ static int cmd_record_stop(const struct shell *sh, size_t argc, char **argv)
 	}
 
 	uint32_t total = (uint32_t)atomic_get(&rec_bytes);
-	uint32_t ms    = total * 1000U /
-			 (SAMPLE_RATE * NUM_CHANNELS * BYTES_PER_SAMPLE);
+	uint32_t ms    = total * 1000U / AUDIO_BYTES_PER_SEC;
 
 	shell_print(sh, "Saved %u bytes (%u.%03u s)", total, ms / 1000U, ms % 1000U);
 	return 0;
@@ -647,8 +550,7 @@ static int cmd_record_status(const struct shell *sh, size_t argc, char **argv)
 		 * up to RING_BLOCKS blocks during fast recordings). */
 		uint32_t captured = (uint32_t)atomic_get(&rec_bytes_queued);
 		uint32_t written  = (uint32_t)atomic_get(&rec_bytes);
-		uint32_t ms = captured * 1000U /
-			      (SAMPLE_RATE * NUM_CHANNELS * BYTES_PER_SAMPLE);
+		uint32_t ms = captured * 1000U / AUDIO_BYTES_PER_SEC;
 
 		shell_print(sh, "Recording: %u B captured, %u B written (%u.%03u s)",
 			    captured, written, ms / 1000U, ms % 1000U);

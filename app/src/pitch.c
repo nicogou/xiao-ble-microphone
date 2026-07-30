@@ -30,10 +30,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/shell/shell.h>
-#include <zephyr/audio/dmic.h>
-#include <zephyr/drivers/regulator.h>
-#include <zephyr/device.h>
-#include <zephyr/devicetree.h>
+#include "mic.h"
 
 LOG_MODULE_REGISTER(pitch, CONFIG_APP_LOG_LEVEL);
 
@@ -42,28 +39,11 @@ extern bool rec_is_active(void);
 extern bool kws_is_active(void);
 
 /* =========================================================================
- * Audio / PDM configuration
- * ========================================================================= */
-
-#define PITCH_SAMPLE_RATE    16000U
-#define PITCH_BITS           16U
-#define PITCH_CHANNELS       1U
-
-/*
- * PDM block: 64 ms = 1024 samples.
- * This equals PITCH_FRAME_SIZE, so each PDM read covers exactly
- * PITCH_FRAME_SIZE / PITCH_HOP_SIZE = 4 hops.
- */
-#define PITCH_PDM_MS         64U
-#define PITCH_PDM_SAMPLES    (PITCH_SAMPLE_RATE * PITCH_PDM_MS / 1000U) /* 1024 */
-#define PITCH_PDM_BYTES      (PITCH_PDM_SAMPLES * PITCH_CHANNELS * (PITCH_BITS / 8U)) /* 2048 */
-#define PITCH_PDM_SLAB_BLKS  4U
-
-K_MEM_SLAB_DEFINE_STATIC(pitch_pdm_slab, PITCH_PDM_BYTES, PITCH_PDM_SLAB_BLKS, 4);
-
-/* =========================================================================
  * Analysis parameters
  * ========================================================================= */
+
+/* Must match the shared mic layer sample rate. */
+#define PITCH_SAMPLE_RATE  MIC_SAMPLE_RATE
 
 /* Analysis window: 1024 samples = 64 ms */
 #define PITCH_FRAME_SIZE   1024U
@@ -106,6 +86,8 @@ K_MEM_SLAB_DEFINE_STATIC(pitch_pdm_slab, PITCH_PDM_BYTES, PITCH_PDM_SLAB_BLKS, 4
 static float pitch_frame[PITCH_FRAME_SIZE]; /* sliding analysis window */
 static float pitch_nsdf[PITCH_NLAGS];       /* NSDF values per lag     */
 static float pitch_hop[PITCH_HOP_SIZE];     /* current hop accumulator */
+static size_t pitch_hop_fill;               /* samples in current hop  */
+static int    pitch_hops_seen;              /* hops completed so far   */
 
 /* =========================================================================
  * State
@@ -262,166 +244,72 @@ static void log_pitch(float f0)
  * Pitch detection thread
  * ========================================================================= */
 
+/*
+ * PDM block callback: accumulate samples into the hop buffer, update the
+ * sliding frame, then run one MPM analysis after freeing the slab block.
+ * Releasing the block before the O(N*lags) NSDF loop keeps the driver
+ * slab from starving.
+ */
+static void pitch_block_cb(void *buf, uint32_t size, void *user_data)
+{
+    ARG_UNUSED(user_data);
+
+    const int16_t *src     = (const int16_t *)buf;
+    size_t         samples = size / sizeof(int16_t);
+
+    for (size_t i = 0; i < samples; i++) {
+        pitch_hop[pitch_hop_fill++] = (float)src[i] / 32768.0f;
+
+        if (pitch_hop_fill == PITCH_HOP_SIZE) {
+            if (pitch_hops_seen >= PITCH_HOPS_TO_PRIME) {
+                memmove(pitch_frame,
+                        pitch_frame + PITCH_HOP_SIZE,
+                        (PITCH_FRAME_SIZE - PITCH_HOP_SIZE) * sizeof(float));
+                memcpy(pitch_frame + PITCH_FRAME_SIZE - PITCH_HOP_SIZE,
+                       pitch_hop, PITCH_HOP_SIZE * sizeof(float));
+            } else {
+                memcpy(pitch_frame + pitch_hops_seen * PITCH_HOP_SIZE,
+                       pitch_hop, PITCH_HOP_SIZE * sizeof(float));
+            }
+            pitch_hops_seen++;
+            pitch_hop_fill = 0;
+        }
+    }
+
+    /* Release slab block before the slow NSDF computation. */
+    mic_block_free(buf);
+
+    if (pitch_hops_seen >= PITCH_HOPS_TO_PRIME) {
+        float f0 = detect_pitch(pitch_frame, PITCH_FRAME_SIZE);
+
+        if (f0 > 0.0f) {
+            log_pitch(f0);
+        }
+    }
+}
+
 static void pitch_thread_fn(void *p1, void *p2, void *p3)
 {
     ARG_UNUSED(p1);
     ARG_UNUSED(p2);
     ARG_UNUSED(p3);
 
-    const struct device *dmic    = DEVICE_DT_GET(DT_NODELABEL(pdm0));
-    const struct device *mic_pwr = DEVICE_DT_GET(DT_NODELABEL(mic_pwr));
-    int ret;
+    if (mic_open() < 0) {
+        goto done;
+    }
 
-    /* Reset analysis state */
-    size_t hop_fill  = 0;
-    int    hops_seen = 0;
-
+    pitch_hop_fill  = 0;
+    pitch_hops_seen = 0;
     memset(pitch_frame, 0, sizeof(pitch_frame));
-
-    /* Power up the microphone */
-    ret = regulator_enable(mic_pwr);
-    if (ret < 0) {
-        LOG_ERR("regulator_enable: %d", ret);
-        goto done;
-    }
-    k_sleep(K_MSEC(100));
-
-    /* Configure PDM */
-    {
-        struct pcm_stream_cfg stream = {
-            .pcm_rate   = PITCH_SAMPLE_RATE,
-            .pcm_width  = PITCH_BITS,
-            .block_size = PITCH_PDM_BYTES,
-            .mem_slab   = &pitch_pdm_slab,
-        };
-        struct dmic_cfg cfg = {
-            .io = {
-                .min_pdm_clk_freq = 1000000,
-                .max_pdm_clk_freq = 3200000,
-                .min_pdm_clk_dc   = 40,
-                .max_pdm_clk_dc   = 60,
-            },
-            .streams = &stream,
-            .channel = {
-                .req_chan_map_lo = dmic_build_channel_map(0, 0, PDM_CHAN_LEFT),
-                .req_num_chan    = PITCH_CHANNELS,
-                .req_num_streams = 1,
-            },
-        };
-
-        ret = dmic_configure(dmic, &cfg);
-        if (ret < 0) {
-            LOG_ERR("dmic_configure: %d", ret);
-            regulator_disable(mic_pwr);
-            goto done;
-        }
-    }
-
-    ret = dmic_trigger(dmic, DMIC_TRIGGER_START);
-    if (ret < 0) {
-        LOG_ERR("DMIC_TRIGGER_START: %d", ret);
-        regulator_disable(mic_pwr);
-        goto done;
-    }
-
-    /* Discard first block – PDM filter warm-up */
-    {
-        void    *buf;
-        uint32_t size;
-
-        if (dmic_read(dmic, 0, &buf, &size, PITCH_PDM_MS * 2) == 0) {
-            k_mem_slab_free(&pitch_pdm_slab, buf);
-        }
-    }
 
     LOG_INF("started  range=%u-%u Hz  frame=%u ms  hop=%u ms  ~%u det/s",
             PITCH_MIN_FREQ, PITCH_MAX_FREQ,
             (unsigned)(PITCH_FRAME_SIZE * 1000U / PITCH_SAMPLE_RATE),
             (unsigned)(PITCH_HOP_SIZE   * 1000U / PITCH_SAMPLE_RATE),
-            (unsigned)(PITCH_SAMPLE_RATE / PITCH_PDM_SAMPLES));
+            (unsigned)(MIC_SAMPLE_RATE / MIC_BLOCK_SAMPLES));
 
-    while (!atomic_get(&pitch_stop_req)) {
-        void    *pdm_buf;
-        uint32_t pdm_size;
-
-        ret = dmic_read(dmic, 0, &pdm_buf, &pdm_size,
-                        PITCH_PDM_MS * 2);
-        if (ret < 0) {
-            LOG_ERR("dmic_read: %d", ret);
-            break;
-        }
-
-        const int16_t *src     = (const int16_t *)pdm_buf;
-        size_t         samples = pdm_size / sizeof(int16_t);
-
-        /*
-         * Phase 1 – sample ingestion (fast, no heavy computation).
-         *
-         * Accumulate int16 PCM samples into the hop buffer.  When a hop
-         * is complete, slide the analysis frame or fill its initial slots.
-         * detect_pitch() is intentionally NOT called here so that the PDM
-         * slab block can be released before the slow NSDF computation.
-         */
-        for (size_t i = 0; i < samples; i++) {
-            pitch_hop[hop_fill++] = (float)src[i] / 32768.0f;
-
-            if (hop_fill == PITCH_HOP_SIZE) {
-                if (hops_seen >= PITCH_HOPS_TO_PRIME) {
-                    /* Slide frame left and append the new hop */
-                    memmove(pitch_frame,
-                            pitch_frame + PITCH_HOP_SIZE,
-                            (PITCH_FRAME_SIZE - PITCH_HOP_SIZE)
-                                * sizeof(float));
-                    memcpy(pitch_frame + PITCH_FRAME_SIZE - PITCH_HOP_SIZE,
-                           pitch_hop, PITCH_HOP_SIZE * sizeof(float));
-                } else {
-                    /* Frame not yet primed: fill the next slot */
-                    memcpy(pitch_frame + hops_seen * PITCH_HOP_SIZE,
-                           pitch_hop, PITCH_HOP_SIZE * sizeof(float));
-                }
-
-                hops_seen++;
-                hop_fill = 0;
-            }
-        }
-
-        /*
-         * Phase 2 – release the PDM slab block NOW, before any heavy work.
-         *
-         * The nRF PDM DMA driver needs free slab blocks to continue filling
-         * new buffers.  Holding the block during the O(N·lags) NSDF loop
-         * starves the driver and causes -ENOMEM / -EAGAIN errors.
-         */
-        k_mem_slab_free(&pitch_pdm_slab, pdm_buf);
-
-        /*
-         * Phase 3 – pitch analysis (once per PDM block, slab already free).
-         *
-         * Run MPM on the latest frame only after the slab has been released.
-         * One analysis per PDM block (≈ 15 detections/s) is ample for
-         * real-time singing feedback.
-         */
-        if (hops_seen >= PITCH_HOPS_TO_PRIME) {
-            float f0 = detect_pitch(pitch_frame, PITCH_FRAME_SIZE);
-
-            if (f0 > 0.0f) {
-                log_pitch(f0);
-            }
-        }
-    }
-
-    /* Stop PDM and drain any remaining driver blocks */
-    dmic_trigger(dmic, DMIC_TRIGGER_STOP);
-    {
-        void    *buf;
-        uint32_t size;
-
-        while (dmic_read(dmic, 0, &buf, &size, 0) == 0) {
-            k_mem_slab_free(&pitch_pdm_slab, buf);
-        }
-    }
-
-    regulator_disable(mic_pwr);
+    mic_run(&pitch_stop_req, pitch_block_cb, NULL);
+    mic_close();
 
 done:
     k_mutex_lock(&pitch_mutex, K_FOREVER);

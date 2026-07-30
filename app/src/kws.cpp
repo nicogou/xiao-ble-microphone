@@ -28,10 +28,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/shell/shell.h>
-#include <zephyr/audio/dmic.h>
-#include <zephyr/drivers/regulator.h>
-#include <zephyr/device.h>
-#include <zephyr/devicetree.h>
+#include "mic.h"
 
 /*
  * Edge Impulse SDK.
@@ -51,32 +48,16 @@ LOG_MODULE_REGISTER(kws, CONFIG_APP_LOG_LEVEL);
 extern "C" bool rec_is_active(void);
 
 /* =========================================================================
- * Audio / PDM configuration
- * ========================================================================= */
-
-#define KWS_SAMPLE_RATE      16000U
-#define KWS_BITS             16U
-#define KWS_CHANNELS         1U
-
-/* 100 ms PDM read blocks (same as in the recording mode). */
-#define KWS_PDM_BLOCK_MS     100U
-#define KWS_PDM_BLOCK_BYTES  \
-    (KWS_SAMPLE_RATE * KWS_PDM_BLOCK_MS / 1000U * KWS_CHANNELS * (KWS_BITS / 8U))
-
-/* Enough slab blocks for hardware double-buffering + a small read queue. */
-#define KWS_PDM_SLAB_BLOCKS  4U
-
-K_MEM_SLAB_DEFINE_STATIC(kws_pdm_slab, KWS_PDM_BLOCK_BYTES, KWS_PDM_SLAB_BLOCKS, 4);
-
-/*
  * Inference slice buffer.
  * EI_CLASSIFIER_SLICE_SIZE = EI_CLASSIFIER_RAW_SAMPLE_COUNT / SLICES_PER_MODEL_WINDOW
- *                          = 15488 / 4 = 3872 samples  (≈ 242 ms at 16 kHz).
- * PDM blocks (1600 samples) are accumulated here until a full slice is ready.
- */
+ *                          = 15488 / 4 = 3872 samples (~242 ms at 16 kHz).
+ * MIC_BLOCK_SAMPLES (1600) are accumulated here until a full slice is ready.
+ * ========================================================================= */
+
 #define KWS_SLICE_SAMPLES  EI_CLASSIFIER_SLICE_SIZE
 
 static int16_t kws_slice_buf[KWS_SLICE_SAMPLES];
+static size_t  kws_slice_fill;
 
 /* =========================================================================
  * Detection threshold
@@ -118,151 +99,74 @@ static int kws_get_data(size_t offset, size_t length, float *out_ptr)
  * KWS inference thread
  * ========================================================================= */
 
+/* PDM block callback: accumulate samples into the slice buffer and run
+ * inference whenever a full slice is ready. */
+static void kws_block_cb(void *buf, uint32_t size, void *user_data)
+{
+    ARG_UNUSED(user_data);
+
+    const int16_t *src     = (const int16_t *)buf;
+    size_t         samples = size / sizeof(int16_t);
+    size_t         pos     = 0;
+
+    while (pos < samples) {
+        size_t space   = (size_t)KWS_SLICE_SAMPLES - kws_slice_fill;
+        size_t to_copy = (samples - pos < space) ? (samples - pos) : space;
+
+        memcpy(&kws_slice_buf[kws_slice_fill], &src[pos],
+               to_copy * sizeof(int16_t));
+        kws_slice_fill += to_copy;
+        pos            += to_copy;
+
+        if (kws_slice_fill == (size_t)KWS_SLICE_SAMPLES) {
+            signal_t signal;
+            signal.total_length = KWS_SLICE_SAMPLES;
+            signal.get_data     = kws_get_data;
+
+            ei_impulse_result_t result;
+            EI_IMPULSE_ERROR res =
+                run_classifier_continuous(&signal, &result, false);
+
+            if (res == EI_IMPULSE_OK) {
+                for (int i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+                    if (result.classification[i].value >= kws_threshold) {
+                        LOG_INF("KWS: '%s' %.0f%%",
+                                result.classification[i].label,
+                                (double)(result.classification[i].value
+                                         * 100.0f));
+                    }
+                }
+            } else {
+                LOG_WRN("kws: inference error %d", (int)res);
+            }
+
+            kws_slice_fill = 0;
+        }
+    }
+
+    mic_block_free(buf);
+}
+
 static void kws_thread_fn(void *p1, void *p2, void *p3)
 {
     ARG_UNUSED(p1);
     ARG_UNUSED(p2);
     ARG_UNUSED(p3);
 
-    const struct device *dmic    = DEVICE_DT_GET(DT_NODELABEL(pdm0));
-    const struct device *mic_pwr = DEVICE_DT_GET(DT_NODELABEL(mic_pwr));
-    int ret;
-
-    /* Power up the microphone */
-    ret = regulator_enable(mic_pwr);
-    if (ret < 0) {
-        LOG_ERR("kws: regulator_enable: %d", ret);
-        goto done;
-    }
-    k_sleep(K_MSEC(100)); /* wait for mic power to stabilise */
-
-    /* Configure PDM */
-    {
-        struct pcm_stream_cfg stream = {
-            .pcm_rate   = KWS_SAMPLE_RATE,
-            .pcm_width  = KWS_BITS,
-            .block_size = KWS_PDM_BLOCK_BYTES,
-            .mem_slab   = &kws_pdm_slab,
-        };
-        struct dmic_cfg cfg = {
-            .io = {
-                .min_pdm_clk_freq = 1000000,
-                .max_pdm_clk_freq = 3200000,
-                .min_pdm_clk_dc   = 40,
-                .max_pdm_clk_dc   = 60,
-            },
-            .streams = &stream,
-            .channel = {
-                .req_chan_map_lo = dmic_build_channel_map(0, 0, PDM_CHAN_LEFT),
-                .req_num_chan    = KWS_CHANNELS,
-                .req_num_streams = 1,
-            },
-        };
-
-        ret = dmic_configure(dmic, &cfg);
-        if (ret < 0) {
-            LOG_ERR("kws: dmic_configure: %d", ret);
-            regulator_disable(mic_pwr);
-            goto done;
-        }
-    }
-
-    ret = dmic_trigger(dmic, DMIC_TRIGGER_START);
-    if (ret < 0) {
-        LOG_ERR("kws: DMIC_TRIGGER_START: %d", ret);
-        regulator_disable(mic_pwr);
+    if (mic_open() < 0) {
         goto done;
     }
 
-    /* Discard first block – PDM filter warm-up */
-    {
-        void    *buf;
-        uint32_t size;
-
-        if (dmic_read(dmic, 0, &buf, &size, KWS_PDM_BLOCK_MS * 2) == 0) {
-            k_mem_slab_free(&kws_pdm_slab, buf);
-        }
-    }
-
-    /* Initialise the EI continuous-inference state */
+    kws_slice_fill = 0;
     run_classifier_init();
 
     LOG_INF("KWS: running  labels=%d  slice=%d samples  threshold=%.2f",
             EI_CLASSIFIER_LABEL_COUNT, KWS_SLICE_SAMPLES, (double)kws_threshold);
 
-    {
-        size_t slice_fill = 0; /* samples accumulated in kws_slice_buf */
-
-        while (!atomic_get(&kws_stop_req)) {
-            void    *pdm_buf;
-            uint32_t pdm_size;
-
-            ret = dmic_read(dmic, 0, &pdm_buf, &pdm_size,
-                            KWS_PDM_BLOCK_MS * 2);
-            if (ret < 0) {
-                LOG_ERR("kws: dmic_read: %d", ret);
-                break;
-            }
-
-            const int16_t *src     = (const int16_t *)pdm_buf;
-            size_t         samples = pdm_size / sizeof(int16_t);
-            size_t         pos     = 0;
-
-            /* Accumulate samples into the slice buffer; run inference
-             * whenever a full slice is ready. */
-            while (pos < samples) {
-                size_t space   = (size_t)KWS_SLICE_SAMPLES - slice_fill;
-                size_t to_copy = (samples - pos < space) ? (samples - pos) : space;
-
-                memcpy(&kws_slice_buf[slice_fill], &src[pos],
-                       to_copy * sizeof(int16_t));
-                slice_fill += to_copy;
-                pos        += to_copy;
-
-                if (slice_fill == (size_t)KWS_SLICE_SAMPLES) {
-                    /* Run one sliding-window inference step */
-                    signal_t signal;
-                    signal.total_length = KWS_SLICE_SAMPLES;
-                    signal.get_data     = kws_get_data;
-
-                    ei_impulse_result_t result;
-                    EI_IMPULSE_ERROR res =
-                        run_classifier_continuous(&signal, &result, false);
-
-                    if (res == EI_IMPULSE_OK) {
-                        for (int i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
-                            if (result.classification[i].value >= kws_threshold) {
-                                LOG_INF("KWS: '%s' %.0f%%",
-                                        result.classification[i].label,
-                                        (double)(result.classification[i].value
-                                                 * 100.0f));
-                            }
-                        }
-                    } else {
-                        LOG_WRN("kws: inference error %d", (int)res);
-                    }
-
-                    slice_fill = 0;
-                }
-            }
-
-            k_mem_slab_free(&kws_pdm_slab, pdm_buf);
-        }
-    }
-
-    /* Stop PDM and drain any blocks still queued in the driver */
-    dmic_trigger(dmic, DMIC_TRIGGER_STOP);
-    {
-        void    *buf;
-        uint32_t size;
-
-        while (dmic_read(dmic, 0, &buf, &size, 0) == 0) {
-            k_mem_slab_free(&kws_pdm_slab, buf);
-        }
-    }
+    mic_run(&kws_stop_req, kws_block_cb, NULL);
 
     run_classifier_deinit();
-    regulator_disable(mic_pwr);
+    mic_close();
 
 done:
     k_mutex_lock(&kws_mutex, K_FOREVER);
