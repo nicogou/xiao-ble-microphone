@@ -100,6 +100,9 @@ static atomic_t  pitch_stop_req = ATOMIC_INIT(0);
 static K_THREAD_STACK_DEFINE(pitch_stack, PITCH_STACK_SIZE);
 static struct k_thread pitch_thread;
 
+/* Note callback registered by the display UI; read inside pitch thread only. */
+static volatile pitch_note_cb_t pitch_note_cb;
+
 /* =========================================================================
  * MPM pitch detection
  * ========================================================================= */
@@ -237,6 +240,11 @@ static void log_pitch(float f0)
         LOG_INF("%.1f Hz  %s%d",
                 (double)f0, NOTE_NAMES[semitone], octave);
     }
+
+    pitch_note_cb_t cb = pitch_note_cb;
+    if (cb != NULL) {
+        cb(NOTE_NAMES[semitone], octave);
+    }
 }
 
 /* =========================================================================
@@ -328,6 +336,41 @@ bool pitch_is_active(void)
     return a;
 }
 
+void pitch_set_note_cb(pitch_note_cb_t cb)
+{
+    pitch_note_cb = cb;
+}
+
+int pitch_start(void)
+{
+    k_mutex_lock(&pitch_mutex, K_FOREVER);
+    if (pitch_active || rec_is_active() || kws_is_active()) {
+        k_mutex_unlock(&pitch_mutex);
+        return -EBUSY;
+    }
+    atomic_set(&pitch_stop_req, 0);
+    pitch_active = true;
+    k_mutex_unlock(&pitch_mutex);
+    k_thread_create(&pitch_thread, pitch_stack,
+                    K_THREAD_STACK_SIZEOF(pitch_stack),
+                    pitch_thread_fn, NULL, NULL, NULL,
+                    7, 0, K_NO_WAIT);
+    k_thread_name_set(&pitch_thread, "pitch");
+    return 0;
+}
+
+int pitch_stop(void)
+{
+    k_mutex_lock(&pitch_mutex, K_FOREVER);
+    bool active = pitch_active;
+    k_mutex_unlock(&pitch_mutex);
+    if (!active) {
+        return -ENODEV;
+    }
+    atomic_set(&pitch_stop_req, 1);
+    return k_thread_join(&pitch_thread, K_SECONDS(3));
+}
+
 /* =========================================================================
  * Shell commands
  * ========================================================================= */
@@ -337,36 +380,25 @@ static int cmd_pitch_start(const struct shell *sh, size_t argc, char **argv)
     ARG_UNUSED(argc);
     ARG_UNUSED(argv);
 
-    k_mutex_lock(&pitch_mutex, K_FOREVER);
-
-    if (pitch_active) {
+    if (pitch_is_active()) {
         shell_error(sh, "Pitch detection already running -- use 'pitch stop' first");
-        k_mutex_unlock(&pitch_mutex);
         return -EBUSY;
     }
     if (rec_is_active()) {
         shell_error(sh, "WAV recording in progress -- use 'record stop' first");
-        k_mutex_unlock(&pitch_mutex);
         return -EBUSY;
     }
     if (kws_is_active()) {
         shell_error(sh, "KWS is running -- use 'kws stop' first");
-        k_mutex_unlock(&pitch_mutex);
         return -EBUSY;
     }
 
-    atomic_set(&pitch_stop_req, 0);
-    pitch_active = true;
-    k_mutex_unlock(&pitch_mutex);
+    int ret = pitch_start();
 
-    k_thread_create(&pitch_thread, pitch_stack,
-                    K_THREAD_STACK_SIZEOF(pitch_stack),
-                    pitch_thread_fn, NULL, NULL, NULL,
-                    7, 0, K_NO_WAIT);
-    k_thread_name_set(&pitch_thread, "pitch");
-
-    shell_print(sh, "Pitch detection started -- use 'pitch stop' to end");
-    return 0;
+    if (ret == 0) {
+        shell_print(sh, "Pitch detection started -- use 'pitch stop' to end");
+    }
+    return ret;
 }
 
 static int cmd_pitch_stop(const struct shell *sh, size_t argc, char **argv)
@@ -374,19 +406,13 @@ static int cmd_pitch_stop(const struct shell *sh, size_t argc, char **argv)
     ARG_UNUSED(argc);
     ARG_UNUSED(argv);
 
-    k_mutex_lock(&pitch_mutex, K_FOREVER);
-    bool active = pitch_active;
-    k_mutex_unlock(&pitch_mutex);
-
-    if (!active) {
+    if (!pitch_is_active()) {
         shell_error(sh, "Pitch detection is not running");
         return -ENODEV;
     }
 
     shell_print(sh, "Stopping pitch detection...");
-    atomic_set(&pitch_stop_req, 1);
-
-    int ret = k_thread_join(&pitch_thread, K_SECONDS(3));
+    int ret = pitch_stop();
 
     if (ret < 0) {
         shell_error(sh, "Pitch thread join timeout: %d", ret);

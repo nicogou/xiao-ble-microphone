@@ -6,25 +6,31 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/usb/usbd.h>
+#if IS_ENABLED(CONFIG_APP_REC)
 #include <zephyr/usb/class/usbd_msc.h>
 #include <zephyr/storage/disk_access.h>
+#endif
 
 #include <app_version.h>
 
 LOG_MODULE_REGISTER(main, CONFIG_APP_LOG_LEVEL);
 
 /* ===========================================================================
- * USB device setup (composite CDC-ACM + MSC)
+ * USB device setup (CDC-ACM shell; composite with MSC when APP_REC is enabled)
  * =========================================================================== */
 
 /* VID 0x2FE3 is the Zephyr project vendor ID -- replace with your own. */
-USBD_DEVICE_DEFINE(usbd_msc_dev,
+USBD_DEVICE_DEFINE(usbd_dev,
    DEVICE_DT_GET(DT_NODELABEL(zephyr_udc0)),
    0x2FE3, 0x0008);
 
 USBD_DESC_LANG_DEFINE(usbd_lang);
 USBD_DESC_MANUFACTURER_DEFINE(usbd_mfr, "Seeed Studio");
+#if IS_ENABLED(CONFIG_APP_REC)
 USBD_DESC_PRODUCT_DEFINE(usbd_product, "XIAO BLE Flash Disk");
+#else
+USBD_DESC_PRODUCT_DEFINE(usbd_product, "XIAO BLE Microphone");
+#endif
 
 #if defined(CONFIG_HWINFO)
 USBD_DESC_SERIAL_NUMBER_DEFINE(usbd_sn);
@@ -33,73 +39,77 @@ USBD_DESC_SERIAL_NUMBER_DEFINE(usbd_sn);
 USBD_DESC_CONFIG_DEFINE(usbd_fs_cfg_desc, "FS Configuration");
 USBD_CONFIGURATION_DEFINE(usbd_fs_config, 0, 125, &usbd_fs_cfg_desc);
 
+#if IS_ENABLED(CONFIG_APP_REC)
 /* "NAND" must match disk-name in the board overlay */
 USBD_DEFINE_MSC_LUN(nand, "NAND", "Seeed", "XIAO Flash", "0.01");
+#endif
 
 static const char *const usbd_blocklist[] = {NULL};
 
 /* ===========================================================================
- * main -- init disk and USB, then idle (shell runs in its own context)
+ * main -- init USB (and flash disk when APP_REC is enabled), then idle
  * =========================================================================== */
 
 int main(void)
 {
 int ret;
 
+#if IS_ENABLED(CONFIG_APP_REC)
 ret = disk_access_init("NAND");
 if (ret) {
 LOG_ERR("disk_access_init: %d", ret);
 return ret;
 }
+#endif
 
-ret = usbd_add_descriptor(&usbd_msc_dev, &usbd_lang);
+ret = usbd_add_descriptor(&usbd_dev, &usbd_lang);
 if (ret) {
 LOG_ERR("lang descriptor: %d", ret);
 return ret;
 }
-ret = usbd_add_descriptor(&usbd_msc_dev, &usbd_mfr);
+ret = usbd_add_descriptor(&usbd_dev, &usbd_mfr);
 if (ret) {
 LOG_ERR("mfr descriptor: %d", ret);
 return ret;
 }
-ret = usbd_add_descriptor(&usbd_msc_dev, &usbd_product);
+ret = usbd_add_descriptor(&usbd_dev, &usbd_product);
 if (ret) {
 LOG_ERR("product descriptor: %d", ret);
 return ret;
 }
 #if defined(CONFIG_HWINFO)
-ret = usbd_add_descriptor(&usbd_msc_dev, &usbd_sn);
+ret = usbd_add_descriptor(&usbd_dev, &usbd_sn);
 if (ret) {
 LOG_ERR("sn descriptor: %d", ret);
 return ret;
 }
 #endif
-ret = usbd_add_configuration(&usbd_msc_dev, USBD_SPEED_FS,
+ret = usbd_add_configuration(&usbd_dev, USBD_SPEED_FS,
      &usbd_fs_config);
 if (ret) {
 LOG_ERR("add_configuration: %d", ret);
 return ret;
 }
-ret = usbd_register_all_classes(&usbd_msc_dev, USBD_SPEED_FS, 1,
+ret = usbd_register_all_classes(&usbd_dev, USBD_SPEED_FS, 1,
 usbd_blocklist);
 if (ret) {
 LOG_ERR("register_all_classes: %d", ret);
 return ret;
 }
 #if defined(CONFIG_USBD_CDC_ACM_CLASS)
-ret = usbd_device_set_code_triple(&usbd_msc_dev, USBD_SPEED_FS,
+ret = usbd_device_set_code_triple(&usbd_dev, USBD_SPEED_FS,
   USB_BCC_MISCELLANEOUS, 0x02, 0x01);
 if (ret) {
 LOG_ERR("set_code_triple: %d", ret);
 return ret;
 }
 #endif
-ret = usbd_init(&usbd_msc_dev);
+ret = usbd_init(&usbd_dev);
 if (ret) {
 LOG_ERR("usbd_init: %d", ret);
 return ret;
 }
-ret = usbd_enable(&usbd_msc_dev);
+ret = usbd_enable(&usbd_dev);
 if (ret) {
 LOG_ERR("usbd_enable: %d", ret);
 return ret;

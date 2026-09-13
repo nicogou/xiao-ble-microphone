@@ -15,10 +15,20 @@ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 
 project(app LANGUAGES C CXX)
 
-target_sources(app PRIVATE
-    src/main.c
-    src/rec.c
-    src/mic.c
-    src/kws.cpp
-    src/pitch.c
-)
+target_sources(app PRIVATE src/main.c)
+
+if(CONFIG_APP_PITCH OR CONFIG_APP_REC OR CONFIG_APP_KWS)
+    target_sources(app PRIVATE src/mic.c)
+endif()
+if(CONFIG_APP_PITCH)
+    target_sources(app PRIVATE src/pitch.c)
+endif()
+if(CONFIG_APP_REC)
+    target_sources(app PRIVATE src/rec.c)
+endif()
+if(CONFIG_APP_KWS)
+    target_sources(app PRIVATE src/kws.cpp)
+endif()
+if(CONFIG_APP_DISPLAY_UI)
+    target_sources(app PRIVATE src/display_ui.c)
+endif()
