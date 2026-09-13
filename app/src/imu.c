@@ -60,6 +60,7 @@ static const struct gpio_dt_spec imu_int =
 
 static struct gpio_callback imu_gpio_cb;
 static struct k_work imu_work;
+static imu_motion_cb_t motion_cb;
 
 /* -------------------------------------------------------------------------
  * Work-queue handler – runs in the system work queue thread
@@ -74,6 +75,9 @@ static void imu_work_handler(struct k_work *work)
 
 	if (func_src1 & IMU_FUNC_SRC1_SIGN_MOT) {
 		LOG_INF("Significant motion detected");
+		if (motion_cb) {
+			motion_cb();
+		}
 	}
 
 	/* Re-arm the interrupt for the next event. */
@@ -181,6 +185,11 @@ int imu_init(void)
 
 	LOG_INF("IMU ready – significant motion detection active");
 	return 0;
+}
+
+void imu_set_motion_cb(imu_motion_cb_t cb)
+{
+	motion_cb = cb;
 }
 
 SYS_INIT(imu_init, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);

@@ -14,6 +14,9 @@
 extern "C" {
 #endif
 
+/** Called from the system work queue when significant motion is confirmed. */
+typedef void (*imu_motion_cb_t)(void);
+
 #if CONFIG_APP_IMU
 /** Initialise the IMU motion-event module.
  *
@@ -23,8 +26,12 @@ extern "C" {
  *  @return 0 on success, negative errno on failure.
  */
 int imu_init(void);
+
+/** Register a callback invoked on every confirmed significant-motion event. */
+void imu_set_motion_cb(imu_motion_cb_t cb);
 #else
 static inline int imu_init(void) { return 0; }
+static inline void imu_set_motion_cb(imu_motion_cb_t cb) { ARG_UNUSED(cb); }
 #endif
 
 #ifdef __cplusplus
