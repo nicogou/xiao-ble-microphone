@@ -13,3 +13,31 @@ endmenu
 module = APP
 module-str = APP
 source "subsys/logging/Kconfig.template.log_config"
+
+config APP_PITCH
+	bool "Pitch detection"
+	help
+	  Real-time monophonic pitch detector (MPM algorithm).
+	  Shell commands: pitch start/stop/status.
+
+config APP_REC
+	bool "WAV recording"
+	help
+	  WAV recording to the external QSPI flash via FAT.
+	  Requires FILE_SYSTEM and FAT_FILESYSTEM_ELM.
+	  Shell commands: record start/stop/status.
+
+config APP_KWS
+	bool "Keyword spotting"
+	help
+	  Keyword spotting using the Edge Impulse SDK.
+	  Requires EDGE_IMPULSE_SDK, CPP, and GLIBCXX_LIBCPP.
+	  Shell commands: kws start/stop/status.
+
+config APP_DISPLAY_UI
+	bool "Round display UI (LVGL)"
+	depends on LVGL && DISPLAY && APP_PITCH
+	select LV_FONT_MONTSERRAT_32
+	help
+	  Enable the LVGL-based round display UI for the Seeed XIAO Round Display.
+	  Build with --shield seeed_xiao_round_display.

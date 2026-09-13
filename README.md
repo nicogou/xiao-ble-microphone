@@ -1,156 +1,176 @@
-# nRF Connect SDK example application
+# XIAO BLE Microphone
 
-<a href="https://github.com/nrfconnect/ncs-example-application/actions/workflows/build-using-docker.yml?query=branch%3Amain">
-  <img src="https://github.com/nrfconnect/ncs-example-application/actions/workflows/build-using-docker.yml/badge.svg?event=push">
-</a>
-<a href="https://github.com/nrfconnect/ncs-example-application/actions/workflows/docs.yml?query=branch%3Amain">
-  <img src="https://github.com/nrfconnect/ncs-example-application/actions/workflows/docs.yml/badge.svg?event=push">
-</a>
-<a href="https://nrfconnect.github.io/ncs-example-application">
-  <img alt="Documentation" src="https://img.shields.io/badge/documentation-3D578C?logo=sphinx&logoColor=white">
-</a>
-<a href="https://nrfconnect.github.io/ncs-example-application/doxygen">
-  <img alt="API Documentation" src="https://img.shields.io/badge/API-documentation-3D578C?logo=c&logoColor=white">
-</a>
+Real-time audio processing firmware for the **Seeed XIAO BLE Sense** (nRF52840),
+built with [nRF Connect SDK v3.4.0](https://developer.nordicsemi.com/nRF_Connect_SDK/doc/3.4.0/nrf/index.html).
 
-This repository contains an nRF Connect SDK example application. The main
-purpose of this repository is to serve as a reference on how to structure nRF Connect
-SDK based applications. Some of the features demonstrated in this example are:
+Each feature is an independent Kconfig module that can be included or excluded
+from the build without touching the source code.
 
-- Basic [Zephyr application][app_dev] skeleton
-- [Zephyr workspace applications][workspace_app]
-- [Zephyr modules][modules]
-- [West T2 topology][west_t2]
-- [Custom boards][board_porting]
-- Custom [devicetree bindings][bindings]
-- Out-of-tree [drivers][drivers]
-- Out-of-tree libraries
-- Example CI configuration (using GitHub Actions)
-- Custom [west extension][west_ext]
-- Custom [Zephyr runner][runner_ext]
-- Doxygen and Sphinx documentation boilerplate
+---
 
-This repository is versioned together with the [nRF Connect SDK main tree][sdk-nrf]. This
-means that every time that nRF Connect SDK is tagged, this repository is tagged as well
-with the same version number, and the [manifest](west.yml) entry for `zephyr`
-will point to the corresponding nRF Connect SDK tag. For example, the `ncs-example-application`
-v2.5.0 will point to nRF Connect SDK v2.5.0. Note that the `main` branch always
-points to the development branch of nRF Connect SDK, also `main`.
+## Hardware
 
-[app_dev]: https://docs.zephyrproject.org/latest/develop/application/index.html
-[workspace_app]: https://docs.zephyrproject.org/latest/develop/application/index.html#zephyr-workspace-app
-[modules]: https://docs.zephyrproject.org/latest/develop/modules.html
-[west_t2]: https://docs.zephyrproject.org/latest/develop/west/workspaces.html#west-t2
-[board_porting]: https://docs.zephyrproject.org/latest/guides/porting/board_porting.html
-[bindings]: https://docs.zephyrproject.org/latest/guides/dts/bindings.html
-[drivers]: https://docs.zephyrproject.org/latest/reference/drivers/index.html
-[sdk-nrf]: https://github.com/nrfconnect/sdk-nrf
-[west_ext]: https://docs.zephyrproject.org/latest/develop/west/extensions.html
-[runner_ext]: https://docs.zephyrproject.org/latest/develop/modules.html#external-runners
+| Component | Required |
+|-----------|----------|
+| [Seeed XIAO BLE Sense](https://wiki.seeedstudio.com/XIAO_BLE/) (nRF52840 + PDM mic) | yes |
+| [Seeed Round Display for XIAO](https://wiki.seeedstudio.com/get_start_round_display/) (240x240 touch display) | for `APP_DISPLAY_UI` |
 
-## Getting started
+---
 
-Before getting started, make sure you have a proper nRF Connect SDK development environment.
-Follow the official
-[Installation guide](https://developer.nordicsemi.com/nRF_Connect_SDK/doc/latest/nrf/installation/install_ncs.html).
+## Features
 
-### Initialization
+| Feature | Kconfig symbol | Enabled by default | Description |
+|---------|---------------|--------------------|-------------|
+| Pitch detection | `APP_PITCH` | yes | Real-time monophonic pitch detector (McLeod Pitch Method). Logs note name + frequency to the shell. |
+| Round display UI | `APP_DISPLAY_UI` | yes | LVGL UI on the round display: button to start/stop pitch detection, live note label. |
+| WAV recording | `APP_REC` | no | Records PDM audio to the on-board QSPI flash. The flash is accessible as a USB mass-storage drive when recording is enabled. |
+| Keyword spotting | `APP_KWS` | no | Continuous keyword detection using the [Edge Impulse SDK](https://docs.edgeimpulse.com/docs/run-inference/cpp-library/deploy-your-model-as-a-zephyr-application). |
 
-This section represents alternative approaches for initializing the workspace.
+---
 
-#### Initialize workspace from scratch
+## Prerequisites
 
-The first step is to initialize the workspace folder (``ncs``) where
-the ``ncs-example-application`` and all nRF Connect SDK modules will be cloned.
-Run the following commands:
+- nRF Connect SDK v3.4.0 with a west workspace initialised (`west init` + `west update`)
+- NCS toolchain installed and on `PATH`
 
-```shell
-# Initialize ncs for the ncs-example-application (main branch)
-west init -m https://github.com/nrfconnect/ncs-example-application --mr main ncs
-# Update nRF Connect SDK modules
-cd ncs
-west update
+All build commands are run from the **workspace root** (the directory containing
+this repository, `nrf/`, `zephyr/`, etc.).
+
+---
+
+## Build
+
+### Default -- pitch detection + round display
+
+```bash
+west build -b xiao_ble/nrf52840/sense \
+  --shield seeed_xiao_round_display \
+  app
 ```
 
-#### Add application into existing nRF Connect SDK workspace
+`--shield seeed_xiao_round_display` is required whenever `CONFIG_APP_DISPLAY_UI=y`
+(the default). To build without the display, remove `CONFIG_APP_DISPLAY_UI=y` and
+the display-related lines from `app/prj.conf` and omit `--shield`.
 
-Assume you have an existing nRF Connect SDK workspace in the ``ncs`` folder. Run the following commands:
+### Add WAV recording
 
-```shell
-# Navigate to the workspace folder
-cd ncs
-# Clone application repository
-git clone https://github.com/nrfconnect/ncs-example-application
-# Set manifest path to the application directory
-west config manifest.path ncs-example-application
-# Update nRF Connect SDK modules
-west update
+```bash
+west build -b xiao_ble/nrf52840/sense \
+  --shield seeed_xiao_round_display \
+  app \
+  -- -DEXTRA_CONF_FILE="rec.conf"
 ```
 
-### Building and running
+When `APP_REC` is enabled the device enumerates as both a CDC-ACM serial port
+and a USB mass-storage drive (the 2 MB QSPI flash).
 
-To build the application, run the following command:
+### Add keyword spotting
 
-```shell
-cd example-application
-west build -b $BOARD app
+```bash
+west build -b xiao_ble/nrf52840/sense \
+  --shield seeed_xiao_round_display \
+  app \
+  -- -DEXTRA_CONF_FILE="kws.conf"
 ```
 
-where `$BOARD` is the target board.
+### All features
 
-You can use the `custom_plank` board found in this repository. Note that you can use
-Zephyr and nRF Connect SDK sample boards if an appropriate overlay is provided (see `app/boards`).
-
-A sample debug configuration is also provided. To apply it, run the following
-command:
-
-```shell
-west build -b $BOARD app -- -DEXTRA_CONF_FILE=debug.conf
+```bash
+west build -b xiao_ble/nrf52840/sense \
+  --shield seeed_xiao_round_display \
+  app \
+  -- -DEXTRA_CONF_FILE="rec.conf;kws.conf"
 ```
 
-Once you have built the application, run the following command to flash it:
+### Force clean rebuild
 
-```shell
-west flash
+Add `-p always` after `west build` to wipe the build directory before configuring.
+
+### Flash
+
+```bash
+west flash -r uf2
 ```
 
-### Testing
+---
 
-To execute Twister integration tests, run the following command:
+## Configuration fragments
 
-```shell
-west twister -T tests --integration
+Two Kconfig fragments live in `app/` and are passed via `-DEXTRA_CONF_FILE`:
+
+| Fragment | Enables |
+|----------|---------|
+| `app/rec.conf` | `APP_REC`, USB MSC class, flash partition map, FAT filesystem |
+| `app/kws.conf` | `APP_KWS`, Edge Impulse SDK, C++ support |
+
+The base `app/prj.conf` always enables pitch detection (`APP_PITCH`), the round
+display UI (`APP_DISPLAY_UI`), the PDM microphone subsystem, and the USB
+CDC-ACM shell.
+
+---
+
+## Shell commands
+
+Connect to the USB CDC-ACM port (any baud rate) to access the Zephyr shell.
+
+### Pitch detection
+
+```
+pitch start    -- start real-time pitch detection
+pitch stop     -- stop detection
+pitch status   -- show current state and parameters
 ```
 
-### Documentation
+Detected notes are printed as `<freq> Hz  <note><octave>  (<cents> ct)`,
+for example `440.0 Hz  A4` or `261.6 Hz  C4  (+3 ct)`.
 
-A minimal documentation setup is provided for Doxygen and Sphinx. To build the
-documentation first change to the ``doc`` folder:
+### WAV recording (`APP_REC`)
 
-```shell
-cd doc
+```
+record start [max_seconds]  -- start recording to recNNNN.wav on the QSPI flash
+record stop                 -- finalise the WAV header and close the file
+record status               -- show captured / written byte counts
 ```
 
-Before continuing, check if you have Doxygen installed. It is recommended to
-use the same Doxygen version used in [CI](.github/workflows/docs.yml). To
-install Sphinx, make sure you have a Python installation in place and run:
+Files are written to the FAT filesystem on the QSPI flash and are accessible
+via the USB mass-storage drive after stopping the recording.
 
-```shell
-pip install -r requirements.txt
+### Keyword spotting (`APP_KWS`)
+
+```
+kws start   -- start continuous keyword detection
+kws stop    -- stop detection
+kws status  -- show current state and label list
 ```
 
-API documentation (Doxygen) can be built using the following command:
+---
 
-```shell
-doxygen
+## Round display UI
+
+Touch the **Start** button on the display to begin pitch detection. The button
+label changes to **Stop** and the detected musical note (e.g. **A4**, **C#3**)
+appears below. Touch **Stop** to end detection; the note label hides.
+
+Pitch detection started or stopped from the shell is reflected on the display
+automatically.
+
+---
+
+## Project structure
+
 ```
-
-The output will be stored in the ``_build_doxygen`` folder. Similarly, the
-Sphinx documentation (HTML) can be built using the following command:
-
-```shell
-make html
+app/
+  src/
+    main.c            USB device init (CDC-ACM always; MSC added by APP_REC)
+    pitch.c / pitch.h Pitch detector (McLeod Pitch Method)
+    rec.c   / rec.h   WAV recorder
+    kws.cpp / kws.h   Keyword spotter (Edge Impulse SDK)
+    mic.c   / mic.h   Shared PDM microphone layer
+    display_ui.c / .h Round display LVGL UI (button + note label)
+  boards/
+    xiao_ble_nrf52840_sense.overlay  QSPI flash + PDM devicetree overlay
+  model/              Edge Impulse compiled model (used by APP_KWS)
+  prj.conf            Base configuration (pitch + display on)
+  rec.conf            Fragment: WAV recording
+  kws.conf            Fragment: keyword spotting
 ```
-
-The output will be stored in the ``_build_sphinx`` folder. You may check for
-other output formats other than HTML by running ``make help``.
