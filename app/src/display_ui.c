@@ -21,6 +21,7 @@
 #include "display_ui.h"
 #include "imu.h"
 #include "pitch.h"
+#include "reward_img.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -59,6 +60,7 @@ static const char * const NOTE_NAMES[NOTE_COUNT] = {
 
 static int     game_target_pos    = 4;    /* start: C */
 static int64_t game_hold_start_ms = -1;  /* -1 = not currently holding */
+static int64_t reward_show_until_ms = 0; /* wall-clock deadline to hide reward image */
 
 /* =========================================================================
  * LVGL widget handles (owned by the display thread)
@@ -76,6 +78,7 @@ static lv_obj_t *g_dot_name;
 static lv_obj_t *g_target_dot;
 static lv_obj_t *g_target_label;
 static lv_obj_t *g_hold_arc;
+static lv_obj_t *g_reward_img;
 
 /* Screen 1 widgets */
 static lv_obj_t *g_btn;
@@ -247,6 +250,12 @@ static void display_thread_fn(void *p1, void *p2, void *p3)
     lv_obj_clear_flag(g_hold_arc, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(g_hold_arc, LV_OBJ_FLAG_HIDDEN);
 
+    /* Reward image – shown briefly on note completion, created last (top layer). */
+    g_reward_img = lv_image_create(g_screen_hello);
+    lv_image_set_src(g_reward_img, &reward_img);
+    lv_obj_center(g_reward_img);
+    lv_obj_add_flag(g_reward_img, LV_OBJ_FLAG_HIDDEN);
+
     /* ---- Screen 1: Pitch detector ---- */
     g_screen_pitch = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(g_screen_pitch, lv_color_black(), 0);
@@ -309,7 +318,9 @@ static void display_thread_fn(void *p1, void *p2, void *p3)
         }
 
         /* ---- Sync button label and note visibility with pitch state ---- */
-        bool is_active = pitch_is_active();
+        bool is_active      = pitch_is_active();
+        bool reward_showing = (reward_show_until_ms > 0 &&
+                               k_uptime_get() < reward_show_until_ms);
 
         if (is_active != was_active) {
             was_active = is_active;
@@ -362,8 +373,10 @@ static void display_thread_fn(void *p1, void *p2, void *p3)
                     }
                     lv_label_set_text(g_dot_name, name_only);
                     lv_obj_align(g_dot_name, LV_ALIGN_CENTER, 0, 65);
-                    lv_obj_clear_flag(g_dot,      LV_OBJ_FLAG_HIDDEN);
-                    lv_obj_clear_flag(g_dot_name, LV_OBJ_FLAG_HIDDEN);
+                    if (!reward_showing) {
+                        lv_obj_clear_flag(g_dot,      LV_OBJ_FLAG_HIDDEN);
+                        lv_obj_clear_flag(g_dot_name, LV_OBJ_FLAG_HIDDEN);
+                    }
                 }
             } else {
                 stale_ticks++;
@@ -378,6 +391,10 @@ static void display_thread_fn(void *p1, void *p2, void *p3)
 
         /* ---- Game: match target note for HOLD_THRESHOLD ticks to advance ---- */
         if (g_current_screen == 0) {
+            if (reward_showing) {
+                /* Keep all game overlay hidden during the reward flash. */
+                lv_obj_add_flag(g_hold_arc, LV_OBJ_FLAG_HIDDEN);
+            } else {
             bool holding = is_active
                         && stale_ticks < STALE_THRESHOLD
                         && last_known_pos >= 0
@@ -402,6 +419,13 @@ static void display_thread_fn(void *p1, void *p2, void *p3)
                     int new_pos = (game_target_pos + 1 +
                                    (int)(sys_rand32_get() % (NOTE_COUNT - 1))) % NOTE_COUNT;
                     game_set_target(new_pos);
+                    reward_show_until_ms = k_uptime_get() + 2000;
+                    lv_obj_clear_flag(g_reward_img,   LV_OBJ_FLAG_HIDDEN);
+                    lv_obj_add_flag(g_dot,            LV_OBJ_FLAG_HIDDEN);
+                    lv_obj_add_flag(g_dot_name,       LV_OBJ_FLAG_HIDDEN);
+                    lv_obj_add_flag(g_target_dot,     LV_OBJ_FLAG_HIDDEN);
+                    lv_obj_add_flag(g_target_label,   LV_OBJ_FLAG_HIDDEN);
+                    lv_obj_add_flag(g_hold_arc,       LV_OBJ_FLAG_HIDDEN);
                 }
             } else {
                 if (game_hold_start_ms >= 0) {
@@ -410,9 +434,19 @@ static void display_thread_fn(void *p1, void *p2, void *p3)
                 }
                 lv_obj_set_style_bg_color(g_dot, lv_color_white(), 0);
             }
+            } /* !reward_showing */
         }
 
         lv_task_handler();
+        /* Hide reward image once its display window has elapsed. */
+        if (reward_show_until_ms > 0 && k_uptime_get() >= reward_show_until_ms) {
+            reward_show_until_ms = 0;
+            lv_obj_add_flag(g_reward_img, LV_OBJ_FLAG_HIDDEN);
+            /* Restore always-visible game overlay; arc/dots restored by loop logic. */
+            lv_obj_clear_flag(g_target_dot,   LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(g_target_label, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_style_bg_color(g_dot, lv_color_white(), 0);
+        }
         k_sleep(K_MSEC(10));
     }
 }
