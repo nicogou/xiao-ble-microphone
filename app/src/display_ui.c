@@ -8,6 +8,9 @@
  *   0 – Note visualiser: white dot slides vertically (Ab=bottom … G=top) while
  *       pitch detection is active; note name shown below the dot.
  *   1 – Pitch detector: "▶ Start / ■ Stop" button + detected note label.
+ *   2 – Asteroid dodge: the UFO orbits with the sung note (same mapping as the
+ *       dot on screen 0) while asteroids fly outwards from the centre in random
+ *       directions; sing to move the UFO out of their way.
  *
  * Threading model:
  *   A dedicated thread owns all LVGL calls (lv_task_handler + widget updates).
@@ -22,6 +25,9 @@
 #include "imu.h"
 #include "pitch.h"
 #include "reward_img.h"
+#include "ufo_img.h"
+#include "asteroid_img.h"
+#include "explosion_img.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -42,6 +48,7 @@ LOG_MODULE_REGISTER(display_ui, CONFIG_APP_LOG_LEVEL);
 static K_MUTEX_DEFINE(note_mutex);
 static char note_buf[8];
 static int  note_pos;   /* 0=Ab(bottom) … 11=G(top); -1=unknown */
+static float note_cents; /* deviation from the note, [-50, +50] */
 static bool note_dirty;
 
 /* =========================================================================
@@ -63,12 +70,49 @@ static int64_t game_hold_start_ms = -1;  /* -1 = not currently holding */
 static int64_t reward_show_until_ms = 0; /* wall-clock deadline to hide reward image */
 
 /* =========================================================================
+ * Asteroid dodge game state (screen 2, display thread only)
+ * ========================================================================= */
+
+#define SCREEN_COUNT      3
+#define UFO_SIZE          34
+#define AST_SIZE          22
+#define UFO_RADIUS        95   /* orbit radius of the UFO centre */
+#define ARENA_RADIUS     140   /* asteroid is recycled past this distance */
+#define MAX_ASTEROIDS     10
+#define COLLISION_DIST    24   /* centre-to-centre pixels counting as a hit */
+#define CRASH_SHOW_MS   1800
+#define EXPLOSION_SIZE    90
+
+/* Speeds are in pixels per 10 ms tick; the game starts slow and ramps up. */
+#define AST_SPEED_START    0.35f
+#define AST_SPEED_MAX      1.10f
+#define AST_SPEED_STEP     0.02f
+#define SPAWN_INTERVAL_START_MS 2200
+#define SPAWN_INTERVAL_MIN_MS    700
+#define SPAWN_INTERVAL_STEP_MS    60
+
+struct asteroid {
+    lv_obj_t *img;
+    float     x, y;    /* centre position in screen coordinates */
+    float     vx, vy;  /* velocity in px per tick */
+    bool      active;
+};
+
+static struct asteroid g_asteroids[MAX_ASTEROIDS];
+static int64_t g_next_spawn_ms;
+static int     g_spawn_interval_ms = SPAWN_INTERVAL_START_MS;
+static float   g_ast_speed         = AST_SPEED_START;
+static int     g_dodged;
+static int64_t g_crash_until_ms;   /* 0 = playing, else deadline of crash banner */
+static int     g_hit_x, g_hit_y;   /* impact point, used to place the explosion */
+
+/* =========================================================================
  * LVGL widget handles (owned by the display thread)
  * ========================================================================= */
 
 static lv_obj_t *g_screen_hello;
 static lv_obj_t *g_screen_pitch;
-static int        g_current_screen; /* 0 = hello world, 1 = pitch detector */
+static int        g_current_screen; /* 0 = note visualiser, 1 = pitch detector, 2 = asteroid dodge */
 
 /* Screen 0 widgets */
 static lv_obj_t *g_dot;
@@ -84,6 +128,12 @@ static lv_obj_t *g_reward_img;
 static lv_obj_t *g_btn;
 static lv_obj_t *g_btn_label;
 static lv_obj_t *g_note_label;
+
+/* Screen 2 widgets */
+static lv_obj_t *g_screen_space;
+static lv_obj_t *g_ufo;
+static lv_obj_t *g_score_label;
+static lv_obj_t *g_explosion;
 
 /* =========================================================================
  * Toggle flag – set in the event callback, consumed in the main loop
@@ -130,7 +180,7 @@ static void on_motion_detected(void)
  * Pitch note callback (pitch thread context)
  * ========================================================================= */
 
-static void on_note_detected(const char *note, int octave)
+static void on_note_detected(const char *note, int octave, float cents)
 {
     char tmp[8];
 
@@ -140,6 +190,7 @@ static void on_note_detected(const char *note, int octave)
     strncpy(note_buf, tmp, sizeof(note_buf) - 1);
     note_buf[sizeof(note_buf) - 1] = '\0';
     note_pos   = note_to_pos(note);
+    note_cents = cents;
     note_dirty = true;
     k_mutex_unlock(&note_mutex);
 }
@@ -173,6 +224,83 @@ static void game_set_target(int pos)
     lv_obj_set_pos(g_target_dot, x, y);
     lv_label_set_text(g_target_label, NOTE_NAMES[pos]);
     lv_arc_set_value(g_hold_arc, 0);
+}
+
+/* =========================================================================
+ * Asteroid dodge helpers (display thread only)
+ * ========================================================================= */
+
+static void space_reset(void)
+{
+    for (int i = 0; i < MAX_ASTEROIDS; i++) {
+        g_asteroids[i].active = false;
+        lv_obj_add_flag(g_asteroids[i].img, LV_OBJ_FLAG_HIDDEN);
+    }
+    g_spawn_interval_ms = SPAWN_INTERVAL_START_MS;
+    g_ast_speed         = AST_SPEED_START;
+    g_dodged            = 0;
+    g_crash_until_ms    = 0;
+    g_next_spawn_ms     = k_uptime_get() + SPAWN_INTERVAL_START_MS;
+    lv_label_set_text(g_score_label, "0");
+    lv_obj_add_flag(g_explosion, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void space_spawn(void)
+{
+    for (int i = 0; i < MAX_ASTEROIDS; i++) {
+        struct asteroid *a = &g_asteroids[i];
+
+        if (a->active) {
+            continue;
+        }
+        float ang = (float)(sys_rand32_get() % 3600) * 0.1f * (3.14159265f / 180.0f);
+        a->x      = 120.0f;
+        a->y      = 120.0f;
+        a->vx     = cosf(ang) * g_ast_speed;
+        a->vy     = sinf(ang) * g_ast_speed;
+        a->active = true;
+        lv_obj_set_pos(a->img, (int)a->x - AST_SIZE / 2, (int)a->y - AST_SIZE / 2);
+        lv_obj_clear_flag(a->img, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+}
+
+/* Advance every asteroid one tick; returns true when one hits the UFO. */
+static bool space_step(int ufo_x, int ufo_y, bool ufo_visible)
+{
+    bool hit = false;
+
+    for (int i = 0; i < MAX_ASTEROIDS; i++) {
+        struct asteroid *a = &g_asteroids[i];
+
+        if (!a->active) {
+            continue;
+        }
+        a->x += a->vx;
+        a->y += a->vy;
+        lv_obj_set_pos(a->img, (int)a->x - AST_SIZE / 2, (int)a->y - AST_SIZE / 2);
+
+        float dx = a->x - 120.0f;
+        float dy = a->y - 120.0f;
+        if (dx * dx + dy * dy > (float)(ARENA_RADIUS * ARENA_RADIUS)) {
+            a->active = false;
+            lv_obj_add_flag(a->img, LV_OBJ_FLAG_HIDDEN);
+            g_dodged++;
+            lv_label_set_text_fmt(g_score_label, "%d", g_dodged);
+            continue;
+        }
+
+        if (ufo_visible) {
+            float ox = a->x - (float)ufo_x;
+            float oy = a->y - (float)ufo_y;
+            if (ox * ox + oy * oy < (float)(COLLISION_DIST * COLLISION_DIST)) {
+                hit     = true;
+                g_hit_x = (int)a->x;
+                g_hit_y = (int)a->y;
+            }
+        }
+    }
+    return hit;
 }
 
 /* =========================================================================
@@ -279,6 +407,35 @@ static void display_thread_fn(void *p1, void *p2, void *p3)
     lv_obj_align(g_note_label, LV_ALIGN_CENTER, 0, 50);
     lv_obj_add_flag(g_note_label, LV_OBJ_FLAG_HIDDEN);
 
+    /* ---- Screen 2: Asteroid dodge ---- */
+    g_screen_space = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(g_screen_space, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(g_screen_space, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(g_screen_space, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_pad_all(g_screen_space, 0, 0);
+
+    g_score_label = lv_label_create(g_screen_space);
+    lv_obj_set_style_text_color(g_score_label, lv_color_make(120, 120, 120), 0);
+    lv_label_set_text(g_score_label, "0");
+    lv_obj_align(g_score_label, LV_ALIGN_TOP_MID, 0, 30);
+
+    for (int i = 0; i < MAX_ASTEROIDS; i++) {
+        g_asteroids[i].img = lv_image_create(g_screen_space);
+        lv_image_set_src(g_asteroids[i].img, &asteroid_img);
+        lv_obj_add_flag(g_asteroids[i].img, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    /* UFO created after the asteroids so it renders on top. */
+    g_ufo = lv_image_create(g_screen_space);
+    lv_image_set_src(g_ufo, &ufo_img);
+    lv_obj_align(g_ufo, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_add_flag(g_ufo, LV_OBJ_FLAG_HIDDEN);
+
+    g_explosion = lv_image_create(g_screen_space);
+    lv_image_set_src(g_explosion, &explosion_img);
+    lv_obj_align(g_explosion, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_add_flag(g_explosion, LV_OBJ_FLAG_HIDDEN);
+
     /* Start on the hello world screen */
     lv_scr_load(g_screen_hello);
     g_current_screen = 0;
@@ -288,21 +445,32 @@ static void display_thread_fn(void *p1, void *p2, void *p3)
     pitch_start();
 
     game_set_target(game_target_pos);
+    space_reset();
 
     bool was_active     = false;
     int  last_known_pos = -1;
+    float last_known_cents = 0.0f;
     int  stale_ticks    = 0;
 
     while (true) {
         /* ---- Handle motion-triggered screen change ---- */
         if (screen_change_requested) {
             screen_change_requested = false;
-            int prev_screen  = g_current_screen;
-            g_current_screen = (g_current_screen + 1) % 2;
-            lv_scr_load(g_current_screen == 0 ? g_screen_hello : g_screen_pitch);
-            if (prev_screen == 0) {
+            g_current_screen = (g_current_screen + 1) % SCREEN_COUNT;
+
+            lv_obj_t *next = g_screen_hello;
+            if (g_current_screen == 1) {
+                next = g_screen_pitch;
+            } else if (g_current_screen == 2) {
+                next = g_screen_space;
+                space_reset();
+            }
+            lv_scr_load(next);
+
+            /* Screen 1 is manually driven by its button; the games need pitch. */
+            if (g_current_screen == 1) {
                 pitch_stop();
-            } else {
+            } else if (!pitch_is_active()) {
                 pitch_start();
             }
         }
@@ -340,20 +508,23 @@ static void display_thread_fn(void *p1, void *p2, void *p3)
         if (is_active) {
             char tmp[8] = {0};
             int  pos    = -1;
+            float cents = 0.0f;
             bool dirty  = false;
 
             k_mutex_lock(&note_mutex, K_FOREVER);
             if (note_dirty) {
                 memcpy(tmp, note_buf, sizeof(tmp));
                 pos        = note_pos;
+                cents      = note_cents;
                 note_dirty = false;
                 dirty      = true;
             }
             k_mutex_unlock(&note_mutex);
 
             if (dirty) {
-                stale_ticks    = 0;
-                last_known_pos = pos;
+                stale_ticks      = 0;
+                last_known_pos   = pos;
+                last_known_cents = cents;
 
                 /* Screen 1: note label (e.g. "A4") */
                 lv_label_set_text(g_note_label, tmp);
@@ -435,6 +606,55 @@ static void display_thread_fn(void *p1, void *p2, void *p3)
                 lv_obj_set_style_bg_color(g_dot, lv_color_white(), 0);
             }
             } /* !reward_showing */
+        }
+
+        /* ---- Asteroid dodge: UFO follows the sung note, asteroids fly out ---- */
+        if (g_current_screen == 2) {
+            bool ufo_visible = is_active
+                            && stale_ticks < STALE_THRESHOLD
+                            && last_known_pos >= 0;
+            int  ufo_x = 120, ufo_y = 120;
+
+            if (ufo_visible) {
+                float a = (90.0f + (last_known_pos + last_known_cents / 100.0f) * 30.0f)
+                          * (3.14159265f / 180.0f);
+                ufo_x = 120 + (int)(UFO_RADIUS * cosf(a));
+                ufo_y = 120 + (int)(UFO_RADIUS * sinf(a));
+                lv_obj_set_pos(g_ufo, ufo_x - UFO_SIZE / 2, ufo_y - UFO_SIZE / 2);
+                lv_obj_clear_flag(g_ufo, LV_OBJ_FLAG_HIDDEN);
+            } else {
+                lv_obj_add_flag(g_ufo, LV_OBJ_FLAG_HIDDEN);
+            }
+
+            if (g_crash_until_ms > 0) {
+                lv_obj_add_flag(g_ufo, LV_OBJ_FLAG_HIDDEN);
+                if (k_uptime_get() >= g_crash_until_ms) {
+                    space_reset();
+                }
+            } else {
+                if (k_uptime_get() >= g_next_spawn_ms) {
+                    space_spawn();
+                    g_next_spawn_ms = k_uptime_get() + g_spawn_interval_ms;
+                    if (g_spawn_interval_ms > SPAWN_INTERVAL_MIN_MS) {
+                        g_spawn_interval_ms -= SPAWN_INTERVAL_STEP_MS;
+                    }
+                    if (g_ast_speed < AST_SPEED_MAX) {
+                        g_ast_speed += AST_SPEED_STEP;
+                    }
+                }
+
+                if (space_step(ufo_x, ufo_y, ufo_visible)) {
+                    for (int i = 0; i < MAX_ASTEROIDS; i++) {
+                        g_asteroids[i].active = false;
+                        lv_obj_add_flag(g_asteroids[i].img, LV_OBJ_FLAG_HIDDEN);
+                    }
+                    lv_obj_add_flag(g_ufo, LV_OBJ_FLAG_HIDDEN);
+                    lv_obj_set_pos(g_explosion, g_hit_x - EXPLOSION_SIZE / 2,
+                                                g_hit_y - EXPLOSION_SIZE / 2);
+                    lv_obj_clear_flag(g_explosion, LV_OBJ_FLAG_HIDDEN);
+                    g_crash_until_ms = k_uptime_get() + CRASH_SHOW_MS;
+                }
+            }
         }
 
         lv_task_handler();

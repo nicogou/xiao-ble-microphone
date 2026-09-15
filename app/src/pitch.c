@@ -243,7 +243,7 @@ static void log_pitch(float f0)
 
     pitch_note_cb_t cb = pitch_note_cb;
     if (cb != NULL) {
-        cb(NOTE_NAMES[semitone], octave);
+        cb(NOTE_NAMES[semitone], octave, cents);
     }
 }
 
