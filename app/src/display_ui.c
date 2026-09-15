@@ -30,6 +30,7 @@
 #include <zephyr/drivers/display.h>
 #include <zephyr/logging/log.h>
 #include <lvgl.h>
+#include <zephyr/random/random.h>
 
 LOG_MODULE_REGISTER(display_ui, CONFIG_APP_LOG_LEVEL);
 
@@ -43,6 +44,23 @@ static int  note_pos;   /* 0=Ab(bottom) … 11=G(top); -1=unknown */
 static bool note_dirty;
 
 /* =========================================================================
+ * Game state (display thread only)
+ * ========================================================================= */
+
+#define DOT_SIZE         30
+#define DOT_RADIUS       95
+#define NOTE_COUNT       12
+#define HOLD_DURATION_MS 1500
+#define STALE_THRESHOLD   30   /* 30 × 10 ms = 0.3 s without new note = silence */
+
+static const char * const NOTE_NAMES[NOTE_COUNT] = {
+    "Ab", "A", "Bb", "B", "C", "C#", "D", "Eb", "E", "F", "F#", "G"
+};
+
+static int     game_target_pos    = 4;    /* start: C */
+static int64_t game_hold_start_ms = -1;  /* -1 = not currently holding */
+
+/* =========================================================================
  * LVGL widget handles (owned by the display thread)
  * ========================================================================= */
 
@@ -53,6 +71,11 @@ static int        g_current_screen; /* 0 = hello world, 1 = pitch detector */
 /* Screen 0 widgets */
 static lv_obj_t *g_dot;
 static lv_obj_t *g_dot_name;
+
+/* Game overlay widgets (screen 0) */
+static lv_obj_t *g_target_dot;
+static lv_obj_t *g_target_label;
+static lv_obj_t *g_hold_arc;
 
 /* Screen 1 widgets */
 static lv_obj_t *g_btn;
@@ -132,6 +155,24 @@ static void btn_event_cb(lv_event_t *e)
 }
 
 /* =========================================================================
+ * Game helper – pick a new target note and update the overlay widgets.
+ * Must be called from the display thread.
+ * ========================================================================= */
+
+static void game_set_target(int pos)
+{
+    game_target_pos    = pos;
+    game_hold_start_ms = -1;
+
+    float a = (90.0f + pos * 30.0f) * (3.14159265f / 180.0f);
+    int x = 120 + (int)(DOT_RADIUS * cosf(a)) - DOT_SIZE / 2;
+    int y = 120 + (int)(DOT_RADIUS * sinf(a)) - DOT_SIZE / 2;
+    lv_obj_set_pos(g_target_dot, x, y);
+    lv_label_set_text(g_target_label, NOTE_NAMES[pos]);
+    lv_arc_set_value(g_hold_arc, 0);
+}
+
+/* =========================================================================
  * Display thread
  * ========================================================================= */
 
@@ -159,7 +200,16 @@ static void display_thread_fn(void *p1, void *p2, void *p3)
     lv_obj_clear_flag(g_screen_hello, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_pad_all(g_screen_hello, 0, 0);
 
-    /* Dot orbits the screen edge; note name stays at the centre. */
+    /* ---- Game overlay: amber target dot created first so g_dot renders on top ---- */
+    g_target_dot = lv_obj_create(g_screen_hello);
+    lv_obj_set_size(g_target_dot, DOT_SIZE, DOT_SIZE);
+    lv_obj_set_style_radius(g_target_dot, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(g_target_dot, lv_palette_main(LV_PALETTE_AMBER), 0);
+    lv_obj_set_style_bg_opa(g_target_dot, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(g_target_dot, 0, 0);
+    lv_obj_align(g_target_dot, LV_ALIGN_TOP_LEFT, 0, 0);   /* positioned by game_set_target */
+
+    /* Detected dot and label drawn on top of the target dot. */
     g_dot = lv_obj_create(g_screen_hello);
     lv_obj_set_size(g_dot, 30, 30);
     lv_obj_set_style_radius(g_dot, LV_RADIUS_CIRCLE, 0);
@@ -173,8 +223,29 @@ static void display_thread_fn(void *p1, void *p2, void *p3)
     lv_obj_set_style_text_font(g_dot_name, &lv_font_montserrat_32, 0);
     lv_obj_set_style_text_color(g_dot_name, lv_color_white(), 0);
     lv_label_set_text(g_dot_name, "");
-    lv_obj_center(g_dot_name);
+    lv_obj_align(g_dot_name, LV_ALIGN_CENTER, 0, 65);
     lv_obj_add_flag(g_dot_name, LV_OBJ_FLAG_HIDDEN);
+
+    g_target_label = lv_label_create(g_screen_hello);
+    lv_obj_set_style_text_font(g_target_label, &lv_font_montserrat_32, 0);
+    lv_obj_set_style_text_color(g_target_label, lv_palette_main(LV_PALETTE_AMBER), 0);
+    lv_label_set_text(g_target_label, "");
+    lv_obj_align(g_target_label, LV_ALIGN_CENTER, 0, -65);
+
+    g_hold_arc = lv_arc_create(g_screen_hello);
+    lv_obj_set_size(g_hold_arc, 70, 70);
+    lv_obj_center(g_hold_arc);
+    lv_arc_set_range(g_hold_arc, 0, 100);
+    lv_arc_set_value(g_hold_arc, 0);
+    lv_arc_set_bg_angles(g_hold_arc, 0, 360);
+    lv_obj_set_style_arc_color(g_hold_arc, lv_palette_main(LV_PALETTE_GREEN), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(g_hold_arc, lv_color_make(50, 50, 50), LV_PART_MAIN);
+    lv_obj_set_style_arc_width(g_hold_arc, 6, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(g_hold_arc, 6, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(g_hold_arc, LV_OPA_TRANSP, 0);
+    lv_obj_remove_style(g_hold_arc, NULL, LV_PART_KNOB);
+    lv_obj_clear_flag(g_hold_arc, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(g_hold_arc, LV_OBJ_FLAG_HIDDEN);
 
     /* ---- Screen 1: Pitch detector ---- */
     g_screen_pitch = lv_obj_create(NULL);
@@ -207,7 +278,11 @@ static void display_thread_fn(void *p1, void *p2, void *p3)
     imu_set_motion_cb(on_motion_detected);
     pitch_start();
 
-    bool was_active = false;
+    game_set_target(game_target_pos);
+
+    bool was_active     = false;
+    int  last_known_pos = -1;
+    int  stale_ticks    = 0;
 
     while (true) {
         /* ---- Handle motion-triggered screen change ---- */
@@ -266,14 +341,15 @@ static void display_thread_fn(void *p1, void *p2, void *p3)
             k_mutex_unlock(&note_mutex);
 
             if (dirty) {
+                stale_ticks    = 0;
+                last_known_pos = pos;
+
                 /* Screen 1: note label (e.g. "A4") */
                 lv_label_set_text(g_note_label, tmp);
 
-                /* Screen 0: orbit dot around the edge, show note name at centre. */
+                /* Screen 0: orbit dot around the edge, show note name below centre. */
                 if (pos >= 0) {
                     /* Ab=6-o'clock (90°), clockwise 30° per semitone. */
-#define DOT_SIZE   30
-#define DOT_RADIUS 95
                     float a = (90.0f + pos * 30.0f) * (3.14159265f / 180.0f);
                     int dot_x = 120 + (int)(DOT_RADIUS * cosf(a)) - DOT_SIZE / 2;
                     int dot_y = 120 + (int)(DOT_RADIUS * sinf(a)) - DOT_SIZE / 2;
@@ -285,15 +361,55 @@ static void display_thread_fn(void *p1, void *p2, void *p3)
                         name_only[j++] = tmp[i];
                     }
                     lv_label_set_text(g_dot_name, name_only);
-                    lv_obj_center(g_dot_name);
+                    lv_obj_align(g_dot_name, LV_ALIGN_CENTER, 0, 65);
                     lv_obj_clear_flag(g_dot,      LV_OBJ_FLAG_HIDDEN);
                     lv_obj_clear_flag(g_dot_name, LV_OBJ_FLAG_HIDDEN);
                 }
+            } else {
+                stale_ticks++;
             }
         } else {
             /* Hide the dot when pitch is not running. */
+            last_known_pos = -1;
+            stale_ticks    = 0;
             lv_obj_add_flag(g_dot,      LV_OBJ_FLAG_HIDDEN);
             lv_obj_add_flag(g_dot_name, LV_OBJ_FLAG_HIDDEN);
+        }
+
+        /* ---- Game: match target note for HOLD_THRESHOLD ticks to advance ---- */
+        if (g_current_screen == 0) {
+            bool holding = is_active
+                        && stale_ticks < STALE_THRESHOLD
+                        && last_known_pos >= 0
+                        && last_known_pos == game_target_pos;
+
+            /* Show/hide the arc based on pitch activity. */
+            if (is_active) {
+                lv_obj_clear_flag(g_hold_arc, LV_OBJ_FLAG_HIDDEN);
+            } else {
+                lv_obj_add_flag(g_hold_arc, LV_OBJ_FLAG_HIDDEN);
+            }
+
+            if (holding) {
+                if (game_hold_start_ms < 0) {
+                    game_hold_start_ms = k_uptime_get();
+                }
+                int64_t elapsed = k_uptime_get() - game_hold_start_ms;
+                lv_arc_set_value(g_hold_arc,
+                    (int)(elapsed * 100 / HOLD_DURATION_MS));
+                lv_obj_set_style_bg_color(g_dot, lv_palette_main(LV_PALETTE_GREEN), 0);
+                if (elapsed >= HOLD_DURATION_MS) {
+                    int new_pos = (game_target_pos + 1 +
+                                   (int)(sys_rand32_get() % (NOTE_COUNT - 1))) % NOTE_COUNT;
+                    game_set_target(new_pos);
+                }
+            } else {
+                if (game_hold_start_ms >= 0) {
+                    game_hold_start_ms = -1;
+                    lv_arc_set_value(g_hold_arc, 0);
+                }
+                lv_obj_set_style_bg_color(g_dot, lv_color_white(), 0);
+            }
         }
 
         lv_task_handler();
