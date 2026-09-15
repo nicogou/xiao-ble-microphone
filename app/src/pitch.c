@@ -99,6 +99,7 @@ static atomic_t  pitch_stop_req = ATOMIC_INIT(0);
 #define PITCH_STACK_SIZE 2048
 static K_THREAD_STACK_DEFINE(pitch_stack, PITCH_STACK_SIZE);
 static struct k_thread pitch_thread;
+static bool pitch_thread_spawned;   /* guards k_thread_join on a never-started thread */
 
 /* Note callback registered by the display UI; read inside pitch thread only. */
 static volatile pitch_note_cb_t pitch_note_cb;
@@ -362,10 +363,22 @@ void pitch_set_level_cb(pitch_level_cb_t cb)
 int pitch_start(void)
 {
     k_mutex_lock(&pitch_mutex, K_FOREVER);
-    if (pitch_active || rec_is_active() || kws_is_active()) {
-        k_mutex_unlock(&pitch_mutex);
+    bool busy = pitch_active || rec_is_active() || kws_is_active();
+    k_mutex_unlock(&pitch_mutex);
+    if (busy) {
         return -EBUSY;
     }
+
+    /* Reap a previous run that ended on its own, e.g. on a PDM read error. */
+    if (pitch_thread_spawned) {
+        int ret = k_thread_join(&pitch_thread, K_SECONDS(1));
+
+        if (ret < 0) {
+            return ret;
+        }
+    }
+
+    k_mutex_lock(&pitch_mutex, K_FOREVER);
     atomic_set(&pitch_stop_req, 0);
     pitch_active = true;
     k_mutex_unlock(&pitch_mutex);
@@ -373,6 +386,7 @@ int pitch_start(void)
                     K_THREAD_STACK_SIZEOF(pitch_stack),
                     pitch_thread_fn, NULL, NULL, NULL,
                     7, 0, K_NO_WAIT);
+    pitch_thread_spawned = true;
     k_thread_name_set(&pitch_thread, "pitch");
     return 0;
 }

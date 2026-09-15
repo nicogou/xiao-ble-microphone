@@ -111,22 +111,26 @@ static int     g_hit_x, g_hit_y;   /* impact point, used to place the explosion 
  * ========================================================================= */
 
 #define STAR_COUNT        12
+#define PLANET_COUNT       3
 #define ROCKET_Y_BOTTOM  195.0f   /* rocket centre when silent */
 #define ROCKET_Y_TOP      60.0f   /* rocket centre at full thrust */
 #define MOON_SIZE         70
 #define MOON_Y_START     (-90)    /* moon centre before lift-off */
 #define MOON_Y_END        60      /* moon centre when the goal is reached */
-#define ROCKET_GOAL      450.0f   /* accumulated thrust needed to reach the moon */
+#define ROCKET_GOAL      200.0f   /* accumulated thrust needed to reach the moon */
 #define WIN_SHOW_MS     2500
 
 /* RMS window mapped to 0 … 100 % thrust; below the floor the rocket falls back. */
 #define LEVEL_FLOOR      0.010f
 #define LEVEL_CEIL       0.120f
 
+static const uint8_t PLANET_SIZE[PLANET_COUNT] = { 26, 16, 36 };
+
 static volatile float g_mic_level;   /* latest RMS, written by the pitch thread */
 static float   g_rocket_y = ROCKET_Y_BOTTOM;
 static float   g_altitude;
 static float   g_star_y[STAR_COUNT];
+static float   g_planet_y[PLANET_COUNT];
 static int64_t g_win_until_ms;
 
 /* =========================================================================
@@ -158,6 +162,7 @@ static lv_obj_t *g_rocket;
 static lv_obj_t *g_flame;
 static lv_obj_t *g_moon;
 static lv_obj_t *g_stars[STAR_COUNT];
+static lv_obj_t *g_planets[PLANET_COUNT];
 static lv_obj_t *g_confetti;
 
 /* =========================================================================
@@ -333,6 +338,14 @@ static void rocket_reset(void)
                        (int)g_star_y[i]);
         lv_obj_clear_flag(g_stars[i], LV_OBJ_FLAG_HIDDEN);
     }
+    /* Stagger the planets so they drift in one at a time from above. */
+    for (int i = 0; i < PLANET_COUNT; i++) {
+        g_planet_y[i] = -(float)(60 + i * 130 + (int)(sys_rand32_get() % 60));
+        lv_obj_set_pos(g_planets[i],
+                       (int)(sys_rand32_get() % (240 - PLANET_SIZE[i])),
+                       (int)g_planet_y[i]);
+        lv_obj_clear_flag(g_planets[i], LV_OBJ_FLAG_HIDDEN);
+    }
     lv_obj_set_pos(g_moon, 120 - MOON_SIZE / 2, MOON_Y_START - MOON_SIZE / 2);
     lv_obj_clear_flag(g_moon, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(g_flame, LV_OBJ_FLAG_HIDDEN);
@@ -345,7 +358,7 @@ static void rocket_reset(void)
  * ========================================================================= */
 
 #define DISPLAY_THREAD_STACK_SIZE 4096
-#define DISPLAY_THREAD_PRIORITY   7  /* same level as the pitch thread */
+#define DISPLAY_THREAD_PRIORITY   8  /* below the pitch thread so audio never starves */
 
 static void display_thread_fn(void *p1, void *p2, void *p3)
 {
@@ -457,6 +470,23 @@ static void display_thread_fn(void *p1, void *p2, void *p3)
     lv_obj_clear_flag(g_screen_rocket, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_pad_all(g_screen_rocket, 0, 0);
 
+    /* Planets sit behind the stars, so create them first. */
+    static const lv_color_t PLANET_COLOR[PLANET_COUNT] = {
+        LV_COLOR_MAKE(200,  90,  60),
+        LV_COLOR_MAKE(110, 140, 210),
+        LV_COLOR_MAKE(160, 120, 190),
+    };
+
+    for (int i = 0; i < PLANET_COUNT; i++) {
+        g_planets[i] = lv_obj_create(g_screen_rocket);
+        lv_obj_set_size(g_planets[i], PLANET_SIZE[i], PLANET_SIZE[i]);
+        lv_obj_set_style_radius(g_planets[i], LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(g_planets[i], PLANET_COLOR[i], 0);
+        lv_obj_set_style_bg_opa(g_planets[i], LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(g_planets[i], 0, 0);
+        lv_obj_align(g_planets[i], LV_ALIGN_TOP_LEFT, 0, 0);
+    }
+
     for (int i = 0; i < STAR_COUNT; i++) {
         g_stars[i] = lv_obj_create(g_screen_rocket);
         lv_obj_set_size(g_stars[i], 4, 4);
@@ -510,6 +540,7 @@ static void display_thread_fn(void *p1, void *p2, void *p3)
     int  last_known_pos = -1;
     float last_known_cents = 0.0f;
     int  stale_ticks    = 0;
+    int64_t pitch_retry_ms = 0;
 
     while (true) {
         /* ---- Handle motion-triggered screen change ---- */
@@ -526,10 +557,13 @@ static void display_thread_fn(void *p1, void *p2, void *p3)
                 space_reset();
             }
             lv_scr_load(next);
+        }
 
-            if (!pitch_is_active()) {
-                pitch_start();
-            }
+        /* Pitch ends itself on a PDM read error; bring it straight back. */
+        if (!pitch_is_active() && k_uptime_get() >= pitch_retry_ms) {
+            LOG_WRN("pitch not running - restarting");
+            pitch_start();
+            pitch_retry_ms = k_uptime_get() + 500;
         }
 
         bool is_active      = pitch_is_active();
@@ -727,6 +761,18 @@ static void display_thread_fn(void *p1, void *p2, void *p3)
                     lv_obj_set_y(g_stars[i], (int)g_star_y[i]);
                 }
 
+                /* Planets are "closer", so they sweep past a little faster. */
+                for (int i = 0; i < PLANET_COUNT; i++) {
+                    g_planet_y[i] += star_speed * 1.5f;
+                    if (g_planet_y[i] > 244.0f) {
+                        g_planet_y[i] = -(float)(PLANET_SIZE[i] +
+                                                 (int)(sys_rand32_get() % 200));
+                        lv_obj_set_x(g_planets[i],
+                            (int)(sys_rand32_get() % (240 - PLANET_SIZE[i])));
+                    }
+                    lv_obj_set_y(g_planets[i], (int)g_planet_y[i]);
+                }
+
                 g_altitude += thrust;
                 float progress = g_altitude / ROCKET_GOAL;
                 if (progress > 1.0f) { progress = 1.0f; }
@@ -740,6 +786,9 @@ static void display_thread_fn(void *p1, void *p2, void *p3)
                     lv_obj_add_flag(g_moon,   LV_OBJ_FLAG_HIDDEN);
                     for (int i = 0; i < STAR_COUNT; i++) {
                         lv_obj_add_flag(g_stars[i], LV_OBJ_FLAG_HIDDEN);
+                    }
+                    for (int i = 0; i < PLANET_COUNT; i++) {
+                        lv_obj_add_flag(g_planets[i], LV_OBJ_FLAG_HIDDEN);
                     }
                     lv_obj_clear_flag(g_confetti, LV_OBJ_FLAG_HIDDEN);
                     g_win_until_ms = k_uptime_get() + WIN_SHOW_MS;
