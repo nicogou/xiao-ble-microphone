@@ -6,6 +6,7 @@ SPRITES = [
     ('ufo.png',       'ufo_img.h',       'ufo_img',       34),
     ('asteroid.png',  'asteroid_img.h',  'asteroid_img',  22),
     ('explosion.png', 'explosion_img.h', 'explosion_img', 90),
+    ('confetti.png',  'confetti_img.h',  'confetti_img', 160),
 ]
 
 

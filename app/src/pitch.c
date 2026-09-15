@@ -102,6 +102,7 @@ static struct k_thread pitch_thread;
 
 /* Note callback registered by the display UI; read inside pitch thread only. */
 static volatile pitch_note_cb_t pitch_note_cb;
+static volatile pitch_level_cb_t pitch_level_cb;
 
 /* =========================================================================
  * MPM pitch detection
@@ -287,6 +288,18 @@ static void pitch_block_cb(void *buf, uint32_t size, void *user_data)
     mic_block_free(buf);
 
     if (pitch_hops_seen >= PITCH_HOPS_TO_PRIME) {
+        pitch_level_cb_t lcb = pitch_level_cb;
+
+        if (lcb != NULL) {
+            const float *tail = pitch_frame + PITCH_FRAME_SIZE - PITCH_HOP_SIZE;
+            float        e    = 0.0f;
+
+            for (size_t i = 0; i < PITCH_HOP_SIZE; i++) {
+                e += tail[i] * tail[i];
+            }
+            lcb(sqrtf(e / (float)PITCH_HOP_SIZE));
+        }
+
         float f0 = detect_pitch(pitch_frame, PITCH_FRAME_SIZE);
 
         if (f0 > 0.0f) {
@@ -339,6 +352,11 @@ bool pitch_is_active(void)
 void pitch_set_note_cb(pitch_note_cb_t cb)
 {
     pitch_note_cb = cb;
+}
+
+void pitch_set_level_cb(pitch_level_cb_t cb)
+{
+    pitch_level_cb = cb;
 }
 
 int pitch_start(void)

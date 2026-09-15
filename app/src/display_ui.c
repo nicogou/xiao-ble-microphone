@@ -5,20 +5,19 @@
  * Round display UI – LVGL-based UI for the Seeed XIAO Round Display (240×240).
  *
  * Screens (cycled by significant motion detected via the IMU):
- *   0 – Note visualiser: white dot slides vertically (Ab=bottom … G=top) while
- *       pitch detection is active; note name shown below the dot.
- *   1 – Pitch detector: "▶ Start / ■ Stop" button + detected note label.
+ *   0 – Rocket launch: any sustained sound lifts the rocket; keep making noise
+ *       to fly all the way up to the moon.
+ *   1 – Note match: white dot orbits with the sung note (Ab=bottom … G=top);
+ *       hold the amber target note to score.
  *   2 – Asteroid dodge: the UFO orbits with the sung note (same mapping as the
- *       dot on screen 0) while asteroids fly outwards from the centre in random
+ *       dot on screen 1) while asteroids fly outwards from the centre in random
  *       directions; sing to move the UFO out of their way.
  *
  * Threading model:
  *   A dedicated thread owns all LVGL calls (lv_task_handler + widget updates).
  *   The pitch note callback runs in the pitch thread; it writes the detected
  *   note into a mutex-protected buffer that the display thread drains every
- *   iteration.  The button toggle request is handled in the display thread's
- *   main loop (not inside the event callback) so that pitch_stop() – which
- *   briefly blocks – does not freeze LVGL event processing.
+ *   iteration.  Pitch detection runs continuously – every screen needs it.
  */
 
 #include "display_ui.h"
@@ -28,6 +27,7 @@
 #include "ufo_img.h"
 #include "asteroid_img.h"
 #include "explosion_img.h"
+#include "confetti_img.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -107,27 +107,44 @@ static int64_t g_crash_until_ms;   /* 0 = playing, else deadline of crash banner
 static int     g_hit_x, g_hit_y;   /* impact point, used to place the explosion */
 
 /* =========================================================================
+ * Rocket launch game state (screen 0, display thread only)
+ * ========================================================================= */
+
+#define STAR_COUNT        12
+#define ROCKET_Y_BOTTOM  195.0f   /* rocket centre when silent */
+#define ROCKET_Y_TOP      60.0f   /* rocket centre at full thrust */
+#define MOON_SIZE         70
+#define MOON_Y_START     (-90)    /* moon centre before lift-off */
+#define MOON_Y_END        60      /* moon centre when the goal is reached */
+#define ROCKET_GOAL      450.0f   /* accumulated thrust needed to reach the moon */
+#define WIN_SHOW_MS     2500
+
+/* RMS window mapped to 0 … 100 % thrust; below the floor the rocket falls back. */
+#define LEVEL_FLOOR      0.010f
+#define LEVEL_CEIL       0.120f
+
+static volatile float g_mic_level;   /* latest RMS, written by the pitch thread */
+static float   g_rocket_y = ROCKET_Y_BOTTOM;
+static float   g_altitude;
+static float   g_star_y[STAR_COUNT];
+static int64_t g_win_until_ms;
+
+/* =========================================================================
  * LVGL widget handles (owned by the display thread)
  * ========================================================================= */
 
 static lv_obj_t *g_screen_hello;
-static lv_obj_t *g_screen_pitch;
-static int        g_current_screen; /* 0 = note visualiser, 1 = pitch detector, 2 = asteroid dodge */
+static int        g_current_screen; /* 0 = rocket launch, 1 = note match, 2 = asteroid dodge */
 
-/* Screen 0 widgets */
+/* Screen 1 widgets */
 static lv_obj_t *g_dot;
 static lv_obj_t *g_dot_name;
 
-/* Game overlay widgets (screen 0) */
+/* Game overlay widgets (screen 1) */
 static lv_obj_t *g_target_dot;
 static lv_obj_t *g_target_label;
 static lv_obj_t *g_hold_arc;
 static lv_obj_t *g_reward_img;
-
-/* Screen 1 widgets */
-static lv_obj_t *g_btn;
-static lv_obj_t *g_btn_label;
-static lv_obj_t *g_note_label;
 
 /* Screen 2 widgets */
 static lv_obj_t *g_screen_space;
@@ -135,11 +152,13 @@ static lv_obj_t *g_ufo;
 static lv_obj_t *g_score_label;
 static lv_obj_t *g_explosion;
 
-/* =========================================================================
- * Toggle flag – set in the event callback, consumed in the main loop
- * ========================================================================= */
-
-static volatile bool toggle_requested;
+/* Screen 0 widgets */
+static lv_obj_t *g_screen_rocket;
+static lv_obj_t *g_rocket;
+static lv_obj_t *g_flame;
+static lv_obj_t *g_moon;
+static lv_obj_t *g_stars[STAR_COUNT];
+static lv_obj_t *g_confetti;
 
 /* =========================================================================
  * Screen-change flag – set by the IMU motion callback, consumed in the loop
@@ -196,16 +215,12 @@ static void on_note_detected(const char *note, int octave, float cents)
 }
 
 /* =========================================================================
- * LVGL button event handler (display thread context via lv_task_handler)
+ * Pitch level callback (pitch thread context)
  * ========================================================================= */
 
-static void btn_event_cb(lv_event_t *e)
+static void on_level_detected(float rms)
 {
-    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
-        toggle_requested = true;
-        /* Disable immediately to prevent double-press. */
-        lv_obj_add_state(g_btn, LV_STATE_DISABLED);
-    }
+    g_mic_level = rms;
 }
 
 /* =========================================================================
@@ -265,8 +280,7 @@ static void space_spawn(void)
     }
 }
 
-/* Advance every asteroid one tick; returns true when one hits the UFO. */
-static bool space_step(int ufo_x, int ufo_y, bool ufo_visible)
+/* Advance every asteroid one tick; returns true when one hits the UFO. */static bool space_step(int ufo_x, int ufo_y, bool ufo_visible)
 {
     bool hit = false;
 
@@ -304,6 +318,29 @@ static bool space_step(int ufo_x, int ufo_y, bool ufo_visible)
 }
 
 /* =========================================================================
+ * Rocket launch helpers (display thread only)
+ * ========================================================================= */
+
+static void rocket_reset(void)
+{
+    g_rocket_y     = ROCKET_Y_BOTTOM;
+    g_altitude     = 0.0f;
+    g_win_until_ms = 0;
+
+    for (int i = 0; i < STAR_COUNT; i++) {
+        g_star_y[i] = (float)(sys_rand32_get() % 240);
+        lv_obj_set_pos(g_stars[i], 10 + (int)(sys_rand32_get() % 220),
+                       (int)g_star_y[i]);
+        lv_obj_clear_flag(g_stars[i], LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_obj_set_pos(g_moon, 120 - MOON_SIZE / 2, MOON_Y_START - MOON_SIZE / 2);
+    lv_obj_clear_flag(g_moon, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(g_flame, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(g_confetti, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(g_rocket, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* =========================================================================
  * Display thread
  * ========================================================================= */
 
@@ -324,7 +361,7 @@ static void display_thread_fn(void *p1, void *p2, void *p3)
     }
     display_blanking_off(disp);
 
-    /* ---- Screen 0: Note visualiser (dot moves Ab=bottom … G=top) ---- */
+    /* ---- Screen 1: Note match (dot moves Ab=bottom … G=top) ---- */
     g_screen_hello = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(g_screen_hello, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(g_screen_hello, LV_OPA_COVER, 0);
@@ -384,29 +421,6 @@ static void display_thread_fn(void *p1, void *p2, void *p3)
     lv_obj_center(g_reward_img);
     lv_obj_add_flag(g_reward_img, LV_OBJ_FLAG_HIDDEN);
 
-    /* ---- Screen 1: Pitch detector ---- */
-    g_screen_pitch = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(g_screen_pitch, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(g_screen_pitch, LV_OPA_COVER, 0);
-
-    /* Toggle button – upper centre */
-    g_btn = lv_btn_create(g_screen_pitch);
-    lv_obj_set_size(g_btn, 150, 60);
-    lv_obj_align(g_btn, LV_ALIGN_CENTER, 0, -30);
-    lv_obj_add_event_cb(g_btn, btn_event_cb, LV_EVENT_CLICKED, NULL);
-
-    g_btn_label = lv_label_create(g_btn);
-    lv_label_set_text(g_btn_label, LV_SYMBOL_PLAY " Start");
-    lv_obj_center(g_btn_label);
-
-    /* Note label – lower centre, hidden until pitch is running */
-    g_note_label = lv_label_create(g_screen_pitch);
-    lv_obj_set_style_text_font(g_note_label, &lv_font_montserrat_32, 0);
-    lv_obj_set_style_text_color(g_note_label, lv_color_white(), 0);
-    lv_label_set_text(g_note_label, "---");
-    lv_obj_align(g_note_label, LV_ALIGN_CENTER, 0, 50);
-    lv_obj_add_flag(g_note_label, LV_OBJ_FLAG_HIDDEN);
-
     /* ---- Screen 2: Asteroid dodge ---- */
     g_screen_space = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(g_screen_space, lv_color_black(), 0);
@@ -436,18 +450,63 @@ static void display_thread_fn(void *p1, void *p2, void *p3)
     lv_obj_align(g_explosion, LV_ALIGN_TOP_LEFT, 0, 0);
     lv_obj_add_flag(g_explosion, LV_OBJ_FLAG_HIDDEN);
 
-    /* Start on the hello world screen */
-    lv_scr_load(g_screen_hello);
+    /* ---- Screen 0: Rocket launch ---- */
+    g_screen_rocket = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(g_screen_rocket, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(g_screen_rocket, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(g_screen_rocket, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_pad_all(g_screen_rocket, 0, 0);
+
+    for (int i = 0; i < STAR_COUNT; i++) {
+        g_stars[i] = lv_obj_create(g_screen_rocket);
+        lv_obj_set_size(g_stars[i], 4, 4);
+        lv_obj_set_style_radius(g_stars[i], LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(g_stars[i], lv_color_white(), 0);
+        lv_obj_set_style_bg_opa(g_stars[i], LV_OPA_70, 0);
+        lv_obj_set_style_border_width(g_stars[i], 0, 0);
+        lv_obj_align(g_stars[i], LV_ALIGN_TOP_LEFT, 0, 0);
+    }
+
+    g_moon = lv_obj_create(g_screen_rocket);
+    lv_obj_set_size(g_moon, MOON_SIZE, MOON_SIZE);
+    lv_obj_set_style_radius(g_moon, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(g_moon, lv_color_make(230, 230, 200), 0);
+    lv_obj_set_style_bg_opa(g_moon, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(g_moon, 0, 0);
+    lv_obj_align(g_moon, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    g_flame = lv_obj_create(g_screen_rocket);
+    lv_obj_set_style_radius(g_flame, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(g_flame, lv_palette_main(LV_PALETTE_ORANGE), 0);
+    lv_obj_set_style_bg_opa(g_flame, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(g_flame, 0, 0);
+    lv_obj_set_size(g_flame, 14, 10);
+    lv_obj_align(g_flame, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_add_flag(g_flame, LV_OBJ_FLAG_HIDDEN);
+
+    /* No rocket artwork yet – the UFO sprite stands in as the spacecraft. */
+    g_rocket = lv_image_create(g_screen_rocket);
+    lv_image_set_src(g_rocket, &ufo_img);
+    lv_obj_align(g_rocket, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    g_confetti = lv_image_create(g_screen_rocket);
+    lv_image_set_src(g_confetti, &confetti_img);
+    lv_obj_center(g_confetti);
+    lv_obj_add_flag(g_confetti, LV_OBJ_FLAG_HIDDEN);
+
+    /* Start on the rocket launch screen */
+    lv_scr_load(g_screen_rocket);
     g_current_screen = 0;
 
     pitch_set_note_cb(on_note_detected);
+    pitch_set_level_cb(on_level_detected);
     imu_set_motion_cb(on_motion_detected);
     pitch_start();
 
     game_set_target(game_target_pos);
     space_reset();
+    rocket_reset();
 
-    bool was_active     = false;
     int  last_known_pos = -1;
     float last_known_cents = 0.0f;
     int  stale_ticks    = 0;
@@ -459,52 +518,25 @@ static void display_thread_fn(void *p1, void *p2, void *p3)
             g_current_screen = (g_current_screen + 1) % SCREEN_COUNT;
 
             lv_obj_t *next = g_screen_hello;
-            if (g_current_screen == 1) {
-                next = g_screen_pitch;
+            if (g_current_screen == 0) {
+                next = g_screen_rocket;
+                rocket_reset();
             } else if (g_current_screen == 2) {
                 next = g_screen_space;
                 space_reset();
             }
             lv_scr_load(next);
 
-            /* Screen 1 is manually driven by its button; the games need pitch. */
-            if (g_current_screen == 1) {
-                pitch_stop();
-            } else if (!pitch_is_active()) {
+            if (!pitch_is_active()) {
                 pitch_start();
             }
         }
 
-        /* ---- Process deferred toggle (pitch_stop may block briefly) ---- */
-        if (toggle_requested) {
-            toggle_requested = false;
-            if (pitch_is_active()) {
-                pitch_stop();
-            } else {
-                pitch_start();
-            }
-        }
-
-        /* ---- Sync button label and note visibility with pitch state ---- */
         bool is_active      = pitch_is_active();
         bool reward_showing = (reward_show_until_ms > 0 &&
                                k_uptime_get() < reward_show_until_ms);
 
-        if (is_active != was_active) {
-            was_active = is_active;
-            if (is_active) {
-                lv_label_set_text(g_btn_label, LV_SYMBOL_STOP " Stop");
-                lv_label_set_text(g_note_label, "---");
-                lv_obj_clear_flag(g_note_label, LV_OBJ_FLAG_HIDDEN);
-            } else {
-                lv_label_set_text(g_btn_label, LV_SYMBOL_PLAY " Start");
-                lv_obj_add_flag(g_note_label, LV_OBJ_FLAG_HIDDEN);
-            }
-            /* Re-enable button now that the transition is complete. */
-            lv_obj_clear_state(g_btn, LV_STATE_DISABLED);
-        }
-
-        /* ---- Push latest detected note to widgets on both screens ---- */
+        /* ---- Push latest detected note to the note-match widgets ---- */
         if (is_active) {
             char tmp[8] = {0};
             int  pos    = -1;
@@ -526,10 +558,7 @@ static void display_thread_fn(void *p1, void *p2, void *p3)
                 last_known_pos   = pos;
                 last_known_cents = cents;
 
-                /* Screen 1: note label (e.g. "A4") */
-                lv_label_set_text(g_note_label, tmp);
-
-                /* Screen 0: orbit dot around the edge, show note name below centre. */
+                /* Note match: orbit dot around the edge, note name below centre. */
                 if (pos >= 0) {
                     /* Ab=6-o'clock (90°), clockwise 30° per semitone. */
                     float a = (90.0f + pos * 30.0f) * (3.14159265f / 180.0f);
@@ -561,7 +590,7 @@ static void display_thread_fn(void *p1, void *p2, void *p3)
         }
 
         /* ---- Game: match target note for HOLD_THRESHOLD ticks to advance ---- */
-        if (g_current_screen == 0) {
+        if (g_current_screen == 1) {
             if (reward_showing) {
                 /* Keep all game overlay hidden during the reward flash. */
                 lv_obj_add_flag(g_hold_arc, LV_OBJ_FLAG_HIDDEN);
@@ -653,6 +682,67 @@ static void display_thread_fn(void *p1, void *p2, void *p3)
                                                 g_hit_y - EXPLOSION_SIZE / 2);
                     lv_obj_clear_flag(g_explosion, LV_OBJ_FLAG_HIDDEN);
                     g_crash_until_ms = k_uptime_get() + CRASH_SHOW_MS;
+                }
+            }
+        }
+
+        /* ---- Rocket launch: loudness is thrust, keep singing to reach the moon ---- */
+        if (g_current_screen == 0) {
+            float thrust = is_active
+                         ? (g_mic_level - LEVEL_FLOOR) / (LEVEL_CEIL - LEVEL_FLOOR)
+                         : 0.0f;
+
+            if (thrust < 0.0f) { thrust = 0.0f; }
+            if (thrust > 1.0f) { thrust = 1.0f; }
+
+            if (g_win_until_ms > 0) {
+                if (k_uptime_get() >= g_win_until_ms) {
+                    rocket_reset();
+                }
+            } else {
+                float target_y = ROCKET_Y_BOTTOM -
+                                 thrust * (ROCKET_Y_BOTTOM - ROCKET_Y_TOP);
+                g_rocket_y += (target_y - g_rocket_y) * 0.12f;
+                lv_obj_set_pos(g_rocket, 120 - UFO_SIZE / 2,
+                               (int)g_rocket_y - UFO_SIZE / 2);
+
+                int flame_h = (int)(thrust * 28.0f);
+                if (flame_h > 4) {
+                    lv_obj_set_size(g_flame, 14, flame_h);
+                    lv_obj_set_pos(g_flame, 120 - 7,
+                                   (int)g_rocket_y + UFO_SIZE / 2 - 4);
+                    lv_obj_clear_flag(g_flame, LV_OBJ_FLAG_HIDDEN);
+                } else {
+                    lv_obj_add_flag(g_flame, LV_OBJ_FLAG_HIDDEN);
+                }
+
+                /* Stars stream downwards faster the harder the rocket pushes. */
+                float star_speed = 0.3f + thrust * 3.5f;
+                for (int i = 0; i < STAR_COUNT; i++) {
+                    g_star_y[i] += star_speed;
+                    if (g_star_y[i] > 244.0f) {
+                        g_star_y[i] = -4.0f;
+                        lv_obj_set_x(g_stars[i], 10 + (int)(sys_rand32_get() % 220));
+                    }
+                    lv_obj_set_y(g_stars[i], (int)g_star_y[i]);
+                }
+
+                g_altitude += thrust;
+                float progress = g_altitude / ROCKET_GOAL;
+                if (progress > 1.0f) { progress = 1.0f; }
+                lv_obj_set_y(g_moon,
+                    MOON_Y_START + (int)(progress * (MOON_Y_END - MOON_Y_START))
+                    - MOON_SIZE / 2);
+
+                if (g_altitude >= ROCKET_GOAL) {
+                    lv_obj_add_flag(g_rocket, LV_OBJ_FLAG_HIDDEN);
+                    lv_obj_add_flag(g_flame,  LV_OBJ_FLAG_HIDDEN);
+                    lv_obj_add_flag(g_moon,   LV_OBJ_FLAG_HIDDEN);
+                    for (int i = 0; i < STAR_COUNT; i++) {
+                        lv_obj_add_flag(g_stars[i], LV_OBJ_FLAG_HIDDEN);
+                    }
+                    lv_obj_clear_flag(g_confetti, LV_OBJ_FLAG_HIDDEN);
+                    g_win_until_ms = k_uptime_get() + WIN_SHOW_MS;
                 }
             }
         }
